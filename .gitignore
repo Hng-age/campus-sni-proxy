@@ -1,0 +1,30 @@
+# 证书、私钥和本机状态：绝对不能上传
+mitm_certs/
+logs/
+state/
+*.crt
+*.key
+*.pem
+*.pfx
+*.srl
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# 本地配置 / 临时文件
+*.log
+*.tmp
+*.zip
+.env
+.env.*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
