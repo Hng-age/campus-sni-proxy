@@ -19,15 +19,35 @@ while (Test-Path $flag) {
     if (-not (Test-Path $flag)) { break }
 
     $alive = $false
+    $portOpen = $false
     try {
-        $tcp = New-Object System.Net.Sockets.TcpClient("127.0.0.1", 8888)
-        $tcp.Close()
-        $alive = $true
+        $conn = Get-NetTCPConnection -LocalPort 8888 -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($conn) {
+            $portOpen = $true
+            $ownerPid = [int]$conn.OwningProcess
+            $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction SilentlyContinue
+            if ($proc -and ($proc.Name -eq "python.exe" -or $proc.Name -eq "pythonw.exe")) {
+                if ($proc.CommandLine -and $proc.CommandLine -like "*mitm_sni_proxy*") {
+                    $alive = $true
+                } else {
+                    $pidFile = Join-Path $root "state\proxy.pid"
+                    if (Test-Path $pidFile) {
+                        $saved = Get-Content $pidFile -Raw -ErrorAction SilentlyContinue
+                        if ($saved -and $saved.Trim() -eq [string]$ownerPid) { $alive = $true }
+                    }
+                }
+            }
+        }
     } catch { }
 
     if ($alive) {
         $downCount = 0
         continue
+    }
+
+    if ($portOpen) {
+        Write-Log "port 8888 is owned by another process; treating proxy as down"
     }
 
     $downCount++

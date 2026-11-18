@@ -1,6 +1,7 @@
 """Per-device CA, wildcard certificate and on-demand site certificates."""
 
 import base64
+import ctypes
 import hashlib
 import os
 import shutil
@@ -8,9 +9,11 @@ import subprocess
 import threading
 import time
 
+from ctypes import wintypes
+
 from . import config
 from .config import NO_WINDOW
-from .logsetup import log, log_error
+from .logsetup import log, log_error, log_warning
 from .netutil import wildcard_covers
 
 _cert_lock = threading.Lock()
@@ -19,9 +22,190 @@ _cert_lock = threading.Lock()
 _cert_fail = {}
 _CERT_FAIL_TTL = 60
 
+if os.name == "nt":
+    _SE_FILE_OBJECT = 1
+    _DACL_SECURITY_INFORMATION = 0x00000004
+    _PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+    _SET_ACCESS = 2
+    _NO_INHERITANCE = 0
+    _TRUSTEE_IS_SID = 0
+    _TRUSTEE_IS_UNKNOWN = 0
+    _FILE_ALL_ACCESS = 0x1F01FF
+
+    class _TRUSTEE_W(ctypes.Structure):
+        _fields_ = [
+            ("pMultipleTrustee", ctypes.c_void_p),
+            ("MultipleTrusteeOperation", ctypes.c_int),
+            ("TrusteeForm", ctypes.c_int),
+            ("TrusteeType", ctypes.c_int),
+            ("ptstrName", ctypes.c_void_p),
+        ]
+
+    class _EXPLICIT_ACCESS_W(ctypes.Structure):
+        _fields_ = [
+            ("grfAccessPermissions", wintypes.DWORD),
+            ("grfAccessMode", ctypes.c_int),
+            ("grfInheritance", wintypes.DWORD),
+            ("Trustee", _TRUSTEE_W),
+        ]
+
+    _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _advapi32.ConvertStringSidToSidW.argtypes = [
+        wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    _advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    _advapi32.SetEntriesInAclW.argtypes = [
+        wintypes.ULONG, ctypes.POINTER(_EXPLICIT_ACCESS_W),
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    _advapi32.SetEntriesInAclW.restype = wintypes.DWORD
+    _advapi32.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR, ctypes.c_int, wintypes.DWORD,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    _advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    _kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    _kernel32.LocalFree.restype = ctypes.c_void_p
+
 
 def ensure_cert_dir():
     os.makedirs(config.CERT_DIR, exist_ok=True)
+
+
+def _current_user_sid():
+    """Return the current Windows user SID, or None."""
+    try:
+        raw = subprocess.run(
+            ["whoami", "/user", "/fo", "csv", "/nh"],
+            capture_output=True, timeout=8,
+            creationflags=NO_WINDOW).stdout
+        out = raw.decode("utf-8", errors="replace")
+        for part in out.replace('"', "").split(","):
+            part = part.strip()
+            if part.startswith("S-1-5-"):
+                return part
+    except Exception:
+        pass
+    return None
+
+
+def _set_restricted_dacl(path, sid):
+    """Replace the file DACL, leaving the SACL/integrity label untouched."""
+    psids = []
+    try:
+        for s in (sid, "S-1-5-18", "S-1-5-32-544"):
+            p = ctypes.c_void_p()
+            if not _advapi32.ConvertStringSidToSidW(s, ctypes.byref(p)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            psids.append(p)
+
+        entries = (_EXPLICIT_ACCESS_W * len(psids))()
+        for i, p in enumerate(psids):
+            entries[i].grfAccessPermissions = _FILE_ALL_ACCESS
+            entries[i].grfAccessMode = _SET_ACCESS
+            entries[i].grfInheritance = _NO_INHERITANCE
+            entries[i].Trustee.MultipleTrusteeOperation = 0
+            entries[i].Trustee.TrusteeForm = _TRUSTEE_IS_SID
+            entries[i].Trustee.TrusteeType = _TRUSTEE_IS_UNKNOWN
+            entries[i].Trustee.ptstrName = p
+
+        acl = ctypes.c_void_p()
+        res = _advapi32.SetEntriesInAclW(
+            len(psids), entries, None, ctypes.byref(acl))
+        if res:
+            raise ctypes.WinError(res)
+        try:
+            res = _advapi32.SetNamedSecurityInfoW(
+                path, _SE_FILE_OBJECT,
+                _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
+                None, None, acl, None)
+            if res:
+                raise ctypes.WinError(res)
+        finally:
+            _kernel32.LocalFree(acl)
+    finally:
+        for p in psids:
+            _kernel32.LocalFree(p)
+
+
+def harden_key_acl(path):
+    """Restrict a private key file to current user + Administrators + SYSTEM."""
+    if os.name != "nt" or not os.path.exists(path):
+        return False
+    sid = _current_user_sid()
+    if not sid:
+        log_warning(f"cannot resolve current user SID for {os.path.basename(path)}")
+        return False
+    try:
+        _set_restricted_dacl(path, sid)
+        return True
+    except Exception as e:
+        log_warning(f"cannot harden ACL for {os.path.basename(path)}: {e}")
+        return False
+
+
+def harden_existing_keys():
+    """Apply the restricted ACL to private keys already on disk (once)."""
+    if not os.path.isdir(config.CERT_DIR):
+        return 0
+    marker = os.path.join(config.CERT_DIR, ".acl_hardened")
+    if os.path.exists(marker):
+        return 0
+    count = 0
+    for name in os.listdir(config.CERT_DIR):
+        if name.endswith(".key") and harden_key_acl(
+                os.path.join(config.CERT_DIR, name)):
+            count += 1
+    try:
+        with open(marker, "w", encoding="ascii") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+    except Exception:
+        pass
+    if count:
+        log(f"  [OK] hardened ACL on {count} private key file(s)")
+    return count
+
+
+def _secure_delete(path):
+    """Overwrite then delete a private key (best effort on Windows)."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r+b") as f:
+            f.write(os.urandom(size))
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+    try:
+        os.remove(path)
+        return True
+    except Exception as e:
+        log_warning(f"cannot dispose {os.path.basename(path)}: {e}")
+        return False
+
+
+def dispose_legacy_private_keys():
+    """Destroy archived 1.0.2 private keys.
+
+    Kept separate from migrate_legacy_identity(): migration is about trust
+    and certificates, disposal is about not keeping a leaked key forever.
+    """
+    if not os.path.isdir(config.LEGACY_DIR):
+        return 0
+    count = 0
+    for root, _dirs, files in os.walk(config.LEGACY_DIR):
+        for name in files:
+            if name.lower().endswith((".key", ".pfx", ".p12")):
+                if _secure_delete(os.path.join(root, name)):
+                    count += 1
+    if count:
+        log(f"  [OK] securely disposed {count} legacy private key file(s)")
+        try:
+            with open(os.path.join(config.LEGACY_DIR, "KEYS_DISPOSED.txt"),
+                      "w", encoding="ascii") as f:
+                f.write("Legacy 1.0.2 private keys were deleted at "
+                        + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+        except Exception:
+            pass
+    return count
 
 
 def generate_ca():
@@ -42,6 +226,7 @@ def generate_ca():
     except Exception as e:
         log_error(f"CA generation failed: {e}")
         raise
+    harden_key_acl(config.CA_KEY)
     log(f"  [OK] CA cert: {config.CA_CERT}")
     return config.CA_KEY, config.CA_CERT
 
@@ -77,6 +262,7 @@ def generate_wildcard():
              "-out", config.WILDCARD_CERT, "-days", "365", "-sha256",
              "-extfile", ext_file],
             capture_output=True, check=True, creationflags=NO_WINDOW)
+        harden_key_acl(config.WILDCARD_KEY)
         log(f"  [OK] wildcard cert: {config.WILDCARD_CERT}")
         return True
     except Exception as e:
@@ -148,8 +334,11 @@ def ensure_identity():
     """Create (or migrate to) a unique CA and wildcard cert on this device."""
     ensure_cert_dir()
     migrate_legacy_identity()
+    # Separate step: the leaked 1.0.2 private keys must not be kept around.
+    dispose_legacy_private_keys()
     ca_key, ca_cert = generate_ca()
     generate_wildcard()
+    harden_existing_keys()
     return ca_key, ca_cert
 
 
@@ -211,6 +400,7 @@ def generate_site_cert(domain):
                 os.remove(ext_file)
             except OSError:
                 pass
+            harden_key_acl(key_file)
             _cert_fail.pop(domain, None)
             return cert_file, key_file
         except Exception as e:

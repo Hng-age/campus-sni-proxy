@@ -3,7 +3,7 @@
 import os
 import shutil
 
-VERSION = "1.0.4"
+VERSION = "1.1.0"
 
 LISTEN_HOST = "127.0.0.1"
 # 允许测试时用环境变量换端口，避免影响正在运行的 8888 实例
@@ -15,6 +15,7 @@ CERT_DIR = os.path.join(BASE_DIR, "mitm_certs")
 STRATEGY_FILE = os.path.join(CERT_DIR, "strategies.json")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 LOG_FILE = os.path.join(LOG_DIR, "proxy.log")
+PID_FILE = os.path.join(BASE_DIR, "state", "proxy.pid")
 
 CA_KEY = os.path.join(CERT_DIR, "ca.key")
 CA_CERT = os.path.join(CERT_DIR, "ca_cert.crt")
@@ -77,12 +78,11 @@ EXTRA_WILDCARD_BASES = ["mcdn.bilivideo.cn", "mcdn.bilivideo.com"]
 WILDCARD_BASES = list(dict.fromkeys(
     [s.lower() for s in BLOCKED_SUFFIXES] + EXTRA_WILDCARD_BASES))
 
-# Upstream TLS: the certificate chain is always verified. In compatibility
-# mode (default) a route whose certificate does not cover the original host
-# is still allowed, because SNI rewriting intentionally connects to a shared
-# CDN edge. Set SNI_STRICT_UPSTREAM=1 to accept only routes whose certificate
-# covers the original hostname.
-STRICT_UPSTREAM = os.environ.get("SNI_STRICT_UPSTREAM", "") == "1"
+# Upstream TLS: the certificate chain is always verified. 1.1.0 enables
+# strict hostname verification by default: the upstream certificate must
+# cover the original hostname. Set SNI_STRICT_UPSTREAM=0 only when you
+# explicitly accept the compatibility trade-off for shared CDN edges.
+STRICT_UPSTREAM = os.environ.get("SNI_STRICT_UPSTREAM", "1") != "0"
 
 # openssl: env override (set by proxy_manager.ps1) -> Git for Windows -> PATH
 OPENSSL = os.environ.get("OPENSSL_EXE") or r"C:\Program Files\Git\usr\bin\openssl.exe"

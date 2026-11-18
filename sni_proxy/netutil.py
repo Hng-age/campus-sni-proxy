@@ -10,6 +10,7 @@ allowed_suffix_set = tuple(BLOCKED_SUFFIXES)
 
 def resolve_domain(domain):
     """UDP DNS A record lookup - merge results from 2 public resolvers."""
+
     def query(server):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -66,6 +67,21 @@ def resolve_domain(domain):
         if len(merged) >= 8:
             break
     return merged
+
+
+def resolve_system(domain):
+    """Resolve via the OS resolver (correct DNS for passthrough traffic)."""
+    try:
+        infos = socket.getaddrinfo(
+            domain, None, socket.AF_INET, socket.SOCK_STREAM)
+        ips = []
+        for info in infos:
+            ip = info[4][0]
+            if ip not in ips:
+                ips.append(ip)
+        return ips
+    except Exception:
+        return []
 
 
 def bare_domain(domain):

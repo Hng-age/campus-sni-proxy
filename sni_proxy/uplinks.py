@@ -108,3 +108,77 @@ def connect_tcp(ip, port, timeout=10):
                 mark_uplink_fail(src)
             continue
     return None, None
+
+
+def connect_tcp_bound(ip, port, src=None, timeout=4):
+    """TCP connect bound to a specific source IP (None = OS default)."""
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        bind_sock(sock, src)
+        sock.connect((ip, port))
+        return sock
+    except Exception:
+        try:
+            if sock:
+                sock.close()
+        except Exception:
+            pass
+        return None
+
+
+def connect_host_direct(host, port, timeout=8):
+    """Fallback: let the OS resolver + routing choose, like a direct client."""
+    try:
+        return socket.create_connection((host, port), timeout=timeout)
+    except Exception:
+        return None
+
+
+def connect_any(ips, port, timeout=4, deadline=7):
+    """Try every IP x every uplink concurrently; first success wins.
+
+    Passthrough must behave like a direct connection even when the proxy
+    process has a different default route (multi-NIC / session 0).
+    """
+    if not _uplinks:
+        scan_uplinks()
+    with _uplink_lock:
+        sources = [None] + list(_uplinks)
+    seen = set()
+    cands = []
+    for ip in ips[:6]:
+        for src in sources:
+            key = (ip, src)
+            if key not in seen:
+                seen.add(key)
+                cands.append(key)
+
+    winner = threading.Event()
+    result = []
+    lock = threading.Lock()
+
+    def worker(ip, src):
+        if winner.is_set():
+            return
+        sock = connect_tcp_bound(ip, port, src, timeout)
+        if sock:
+            with lock:
+                if winner.is_set():
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                else:
+                    result.append(sock)
+                    winner.set()
+
+    threads = [threading.Thread(target=worker, args=(ip, src), daemon=True)
+               for ip, src in cands]
+    for t in threads:
+        t.start()
+    winner.wait(deadline)
+    winner.set()
+    with lock:
+        return result[0] if result else None

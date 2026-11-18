@@ -1,5 +1,6 @@
 """Proxy server: CONNECT handling, MITM/passthrough forwarding, main loop."""
 
+import os
 import socket
 import ssl
 import sys
@@ -7,16 +8,16 @@ import threading
 
 from . import config
 from .certs import ensure_identity, generate_site_cert
-from .logsetup import log, log_debug, log_error
-from .netutil import is_blocked_domain, resolve_domain
+from .logsetup import log, log_debug, log_error, log_warning
+from .netutil import is_blocked_domain, resolve_domain, resolve_system
 from .upstream import connect_upstream, load_strategy_cache
-from .uplinks import connect_tcp
+from .uplinks import connect_any, connect_host_direct, connect_tcp
 
 
 def _is_disconnect(exc):
-    """Common peer-closed / reset errors are normal, not failures."""
+    """Common peer-closed / reset / client TLS-alert errors are not failures."""
     if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
-                        BrokenPipeError)):
+                        BrokenPipeError, ssl.SSLError)):
         return True
     return getattr(exc, "winerror", None) in (10053, 10054, 10058)
 
@@ -140,19 +141,20 @@ def handle_https_mitm(client_sock, host, port):
 def handle_passthrough(client_sock, host, port):
     server_sock = None
     try:
-        ips = resolve_domain(host)
+        ips = resolve_system(host)
+        for ip in resolve_domain(host):
+            if ip not in ips:
+                ips.append(ip)
         if not ips:
             client_sock.sendall(b"HTTP/1.1 502 DNS Fail\r\n\r\n")
             client_sock.close()
             return
 
-        # try up to 3 IPs (CDN rotation / flaky routes), multi-path balanced
-        server_sock = None
-        for ip in ips[:3]:
-            s, _src = connect_tcp(ip, port, timeout=8)
-            if s is not None:
-                server_sock = s
-                break
+        # try every IP x every uplink concurrently; passthrough must behave
+        # like a direct connection even when the proxy's default route differs
+        server_sock = connect_any(ips, port, timeout=4, deadline=7)
+        if server_sock is None:
+            server_sock = connect_host_direct(host, port, timeout=8)
         if server_sock is None:
             client_sock.sendall(b"HTTP/1.1 502 Connect Fail\r\n\r\n")
             client_sock.close()
@@ -196,13 +198,18 @@ def handle_http_request(client_sock, request):
         lines[0] = f"{first_line.split(' ')[0]} {path} HTTP/1.1"
         new_request = "\r\n".join(lines)
 
-        ips = resolve_domain(host)
+        ips = resolve_system(host)
+        for ip in resolve_domain(host):
+            if ip not in ips:
+                ips.append(ip)
         if not ips:
             client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             client_sock.close()
             return
 
-        server_sock, _src = connect_tcp(ips[0], port, timeout=10)
+        server_sock = connect_any(ips, port, timeout=4, deadline=7)
+        if server_sock is None:
+            server_sock = connect_host_direct(host, port, timeout=8)
         if server_sock is None:
             client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             client_sock.close()
@@ -267,6 +274,25 @@ def handle_client(client_sock, addr):
             pass
 
 
+def _write_pid():
+    try:
+        os.makedirs(os.path.dirname(config.PID_FILE), exist_ok=True)
+        with open(config.PID_FILE, "w", encoding="ascii") as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        log_warning(f"cannot write pid file: {e}")
+
+
+def _remove_pid():
+    try:
+        if os.path.exists(config.PID_FILE):
+            with open(config.PID_FILE, "r", encoding="ascii") as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(config.PID_FILE)
+    except Exception:
+        pass
+
+
 def main():
     ensure_identity()
     load_strategy_cache()
@@ -293,14 +319,18 @@ def main():
         except Exception:
             pass
 
-    while True:
-        try:
-            client_sock, addr = server.accept()
-            t = threading.Thread(target=handle_client, args=(client_sock, addr))
-            t.daemon = True
-            t.start()
-        except KeyboardInterrupt:
-            log("Stopped")
-            break
-        except Exception as e:
-            log_error(f"accept: {e}")
+    _write_pid()
+    try:
+        while True:
+            try:
+                client_sock, addr = server.accept()
+                t = threading.Thread(target=handle_client, args=(client_sock, addr))
+                t.daemon = True
+                t.start()
+            except KeyboardInterrupt:
+                log("Stopped")
+                break
+            except Exception as e:
+                log_error(f"accept: {e}")
+    finally:
+        _remove_pid()

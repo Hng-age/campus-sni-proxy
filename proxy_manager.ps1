@@ -2,7 +2,7 @@
 # 需要管理员权限：双击 bat 会自动请求提权，直接运行本脚本也会自动提权
 
 $ErrorActionPreference = "Stop"
-$Version = "1.0.4"
+$Version = "1.1.0"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProxyScript = Join-Path $ScriptDir "mitm_sni_proxy.py"
 $CertDir = Join-Path $ScriptDir "mitm_certs"
@@ -347,8 +347,18 @@ function Initialize-Certs {
             if ($removed -gt 0) {
                 Write-Host "  [OK] 已移除 1.0.2 共享根证书" -ForegroundColor Green
             }
+            $still = 0
+            foreach ($store in @("Cert:\LocalMachine\Root", "Cert:\CurrentUser\Root")) {
+                $still += @(Get-ChildItem $store -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Thumbprint -eq $thumb }).Count
+            }
+            if ($still -gt 0) {
+                Write-Host "  [!!] 旧共享根证书仍在信任库中（$still 个），请手动删除" -ForegroundColor Red
+            } else {
+                Write-Host "  [OK] 已确认旧共享根证书从信任库移除" -ForegroundColor Green
+                Remove-Item $LegacyThumbFile -Force -ErrorAction SilentlyContinue
+            }
         }
-        Remove-Item $LegacyThumbFile -Force -ErrorAction SilentlyContinue
     }
 
     return ((Test-Path $CaCert) -and (Test-Path $WildcardCert))
@@ -583,14 +593,32 @@ function Measure-MultiSpeed {
 }
 
 # ---------------- 状态检测 ----------------
-function Test-ProxyRunning {
+function Get-ProxyListenerPid {
     try {
-        $tcp = New-Object System.Net.Sockets.TcpClient("127.0.0.1", 8888)
-        $tcp.Close()
-        return $true
+        $conn = Get-NetTCPConnection -LocalPort 8888 -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($conn) { return [int]$conn.OwningProcess }
+    } catch { }
+    return $null
+}
+
+function Test-ProxyRunning {
+    $listenerPid = Get-ProxyListenerPid
+    if (-not $listenerPid) { return $false }
+    try {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$listenerPid" -ErrorAction SilentlyContinue
     } catch {
-        return $false
+        $proc = $null
     }
+    if (-not $proc) { return $false }
+    if ($proc.Name -notin @("python.exe", "pythonw.exe")) { return $false }
+    if ($proc.CommandLine -and $proc.CommandLine -like "*mitm_sni_proxy*") { return $true }
+    $pidFile = Join-Path $StateDir "proxy.pid"
+    if (Test-Path $pidFile) {
+        $saved = Get-Content $pidFile -Raw -ErrorAction SilentlyContinue
+        if ($saved -and $saved.Trim() -eq [string]$listenerPid) { return $true }
+    }
+    return $false
 }
 
 function Test-CaInstalled {
