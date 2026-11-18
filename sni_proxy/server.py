@@ -9,7 +9,7 @@ import threading
 from . import config
 from .certs import ensure_identity, generate_site_cert
 from .logsetup import log, log_debug, log_error, log_warning
-from .netutil import is_blocked_domain, resolve_domain, resolve_system
+from .netutil import is_blocked_domain, matches_suffix, resolve_domain, resolve_system
 from .upstream import connect_upstream, load_strategy_cache
 from .uplinks import connect_any, connect_host_direct, connect_tcp
 
@@ -39,17 +39,36 @@ def pump(src, dst):
 
 
 def forward_bidirectional(a, b):
-    t1 = threading.Thread(target=pump, args=(a, b), daemon=True)
-    t2 = threading.Thread(target=pump, args=(b, a), daemon=True)
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
+    # one extra thread instead of two; whichever direction ends first
+    # closes both sockets so the other side unblocks
+    t = threading.Thread(target=pump, args=(a, b), daemon=True)
+    t.start()
+    pump(b, a)
     for s in (a, b):
         try:
             s.close()
         except Exception:
             pass
+
+
+_server_ctx_cache = {}
+_server_ctx_lock = threading.Lock()
+
+
+def _server_context(cert_file, key_file):
+    """Cache server-side SSL contexts per certificate pair."""
+    key = (cert_file, key_file)
+    with _server_ctx_lock:
+        ctx = _server_ctx_cache.get(key)
+        if ctx is None:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert_file, key_file)
+            try:
+                ctx.set_alpn_protocols(["http/1.1"])
+            except Exception:
+                pass
+            _server_ctx_cache[key] = ctx
+    return ctx
 
 
 def soft_fail_mitm(client_sock, host):
@@ -61,12 +80,7 @@ def soft_fail_mitm(client_sock, host):
         if not cert_file:
             client_sock.close()
             return
-        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        server_ctx.load_cert_chain(cert_file, key_file)
-        try:
-            server_ctx.set_alpn_protocols(["http/1.1"])
-        except Exception:
-            pass
+        server_ctx = _server_context(cert_file, key_file)
         tls_client = server_ctx.wrap_socket(client_sock, server_side=True)
         tls_client.settimeout(10)
         try:
@@ -97,7 +111,11 @@ def handle_https_mitm(client_sock, host, port):
     try:
         upstream, sni_used = connect_upstream(host, port)
         if not upstream:
-            log(f"  [SOFT] {host}: {sni_used} -> 204 soft-fail")
+            msg = f"  [SOFT] {host}: {sni_used} -> 204 soft-fail"
+            if matches_suffix(host, ("zijieapi.com",)):
+                log_debug(msg)
+            else:
+                log(msg)
             soft_fail_mitm(client_sock, host)
             return
 
@@ -109,12 +127,7 @@ def handle_https_mitm(client_sock, host, port):
             upstream.close()
             return
 
-        server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        server_ctx.load_cert_chain(cert_file, key_file)
-        try:
-            server_ctx.set_alpn_protocols(["http/1.1"])
-        except Exception:
-            pass
+        server_ctx = _server_context(cert_file, key_file)
 
         try:
             tls_client = server_ctx.wrap_socket(client_sock, server_side=True)
@@ -178,10 +191,46 @@ def handle_passthrough(client_sock, host, port):
                 pass
 
 
+def _read_http_body(client_sock, initial, lines):
+    """Read the rest of a plain-HTTP body (Content-Length or chunked)."""
+    length = 0
+    chunked = False
+    for line in lines[1:]:
+        lower = line.lower()
+        if lower.startswith("content-length:"):
+            try:
+                length = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                length = 0
+        elif lower.startswith("transfer-encoding:") and "chunked" in lower:
+            chunked = True
+
+    body = initial
+    if chunked:
+        while b"\r\n0\r\n\r\n" not in body and not body.endswith(b"0\r\n\r\n"):
+            chunk = client_sock.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+    elif length > len(body):
+        need = length - len(body)
+        buf = bytearray(body)
+        while need > 0:
+            chunk = client_sock.recv(min(65536, need))
+            if not chunk:
+                break
+            buf.extend(chunk)
+            need -= len(chunk)
+        body = bytes(buf)
+    return body
+
+
 def handle_http_request(client_sock, request):
     try:
         from urllib.parse import urlparse
-        first_line = request.split("\r\n")[0]
+        head, body = request.split(b"\r\n\r\n", 1)
+        lines = head.decode("iso-8859-1").split("\r\n")
+        first_line = lines[0]
         url = first_line.split(" ")[1] if " " in first_line else ""
         if not url.startswith("http://"):
             client_sock.close()
@@ -194,9 +243,10 @@ def handle_http_request(client_sock, request):
         if parsed.query:
             path += "?" + parsed.query
 
-        lines = request.split("\r\n")
+        body = _read_http_body(client_sock, body, lines)
         lines[0] = f"{first_line.split(' ')[0]} {path} HTTP/1.1"
-        new_request = "\r\n".join(lines)
+        payload = ("\r\n".join(lines).encode("iso-8859-1")
+                   + b"\r\n\r\n" + body)
 
         ips = resolve_system(host)
         for ip in resolve_domain(host):
@@ -214,7 +264,7 @@ def handle_http_request(client_sock, request):
             client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             client_sock.close()
             return
-        server_sock.sendall(new_request.encode())
+        server_sock.sendall(payload)
         server_sock.settimeout(None)
         forward_bidirectional(client_sock, server_sock)
     except Exception as e:
@@ -240,9 +290,7 @@ def handle_client(client_sock, addr):
             request += chunk
         client_sock.settimeout(None)
 
-        request_str = request.decode(errors="replace")
-        first_line = request_str.split("\r\n")[0]
-
+        first_line = request.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
         if first_line.startswith("CONNECT"):
             parts = first_line.split()
             if len(parts) >= 2:
@@ -259,7 +307,7 @@ def handle_client(client_sock, addr):
                     handle_passthrough(client_sock, host, port)
                 return
         else:
-            handle_http_request(client_sock, request_str)
+            handle_http_request(client_sock, request)
             return
 
         client_sock.close()

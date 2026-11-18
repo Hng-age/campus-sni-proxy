@@ -19,19 +19,34 @@ from .config import (
     STRICT_UPSTREAM,
 )
 from .logsetup import log, log_error
-from .netutil import bare_domain, cert_covers, resolve_domain
+from .netutil import bare_domain, cert_covers, matches_suffix, resolve_domain
 from .uplinks import connect_tcp
 
 _strategy_lock = threading.Lock()
 _save_lock = threading.Lock()
-_asset_suffixes = tuple(ASSET_COMPAT_SUFFIXES)
+_tls_ctx = None
+_tls_ctx_lock = threading.Lock()
 
 
 def allow_chain_route(domain):
     """Chain-only routes are acceptable for static assets in strict mode."""
     if not STRICT_UPSTREAM:
         return True
-    return ASSET_COMPAT and domain.lower().endswith(_asset_suffixes)
+    return ASSET_COMPAT and matches_suffix(domain, ASSET_COMPAT_SUFFIXES)
+
+
+def _client_tls_context():
+    """Build the verifying client context once (load_default_certs is slow)."""
+    global _tls_ctx
+    if _tls_ctx is None:
+        with _tls_ctx_lock:
+            if _tls_ctx is None:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_REQUIRED
+                ctx.load_default_certs()
+                _tls_ctx = ctx
+    return _tls_ctx
 
 # domain -> {"endpoints": [(ip, sni, level), ...], "fail_ts": float|None}
 _strategy_cache = {}
@@ -44,10 +59,7 @@ def try_tls(ip, sni, timeout=ATTEMPT_TIMEOUT, verify_host=None):
     if sock is None:
         return None
     try:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_REQUIRED
-        ctx.load_default_certs()
+        ctx = _client_tls_context()
         ssock = ctx.wrap_socket(sock, server_hostname=sni)
         if verify_host:
             try:

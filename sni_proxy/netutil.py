@@ -1,11 +1,16 @@
 """DNS resolution, domain matching and certificate hostname matching."""
 
+import random
 import socket
 import struct
 
 from .config import SNI_REWRITE, BLOCKED_SUFFIXES, WILDCARD_BASES
 
-allowed_suffix_set = tuple(BLOCKED_SUFFIXES)
+
+def matches_suffix(domain, suffixes):
+    """Exact suffix match: douyin.com matches, notdouyin.com does not."""
+    d = domain.lower().rstrip(".")
+    return any(d == s or d.endswith("." + s) for s in suffixes)
 
 
 def resolve_domain(domain):
@@ -15,13 +20,17 @@ def resolve_domain(domain):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(2.5)
-            q = struct.pack('>HHHHHH', 0x1234, 0x0100, 1, 0, 0, 0)
+            qid = random.randint(1, 0xFFFF)
+            q = struct.pack('>HHHHHH', qid, 0x0100, 1, 0, 0, 0)
             for part in domain.split('.'):
                 q += bytes([len(part)]) + part.encode()
             q += b'\x00' + struct.pack('>HH', 1, 1)
             s.sendto(q, (server, 53))
             data, _ = s.recvfrom(4096)
             s.close()
+
+            if len(data) < 12 or struct.unpack('>H', data[:2])[0] != qid:
+                return []
 
             ips = []
             pos = 12
@@ -66,6 +75,9 @@ def resolve_domain(domain):
                 merged.append(ip)
         if len(merged) >= 8:
             break
+    if not merged:
+        # campus networks sometimes drop direct UDP/53 to public resolvers
+        return resolve_system(domain)
     return merged
 
 
@@ -90,10 +102,10 @@ def bare_domain(domain):
 
 
 def is_blocked_domain(domain):
-    d = domain.lower()
+    d = domain.lower().rstrip(".")
     if d in SNI_REWRITE:
         return True
-    return d.endswith(allowed_suffix_set)
+    return matches_suffix(d, BLOCKED_SUFFIXES)
 
 
 def wildcard_covers(domain):
