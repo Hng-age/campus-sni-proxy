@@ -292,6 +292,7 @@ def save_strategy_cache():
                 }
         tmp = STRATEGY_FILE + ".tmp"
         with _save_lock:
+            os.makedirs(os.path.dirname(STRATEGY_FILE), exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f)
             for _ in range(3):
