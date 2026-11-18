@@ -1,8 +1,8 @@
-﻿# SNI Proxy Manager - 一键启动/停止
+﻿﻿# SNI Proxy Manager - 一键启动/停止
 # 需要管理员权限：双击 bat 会自动请求提权，直接运行本脚本也会自动提权
 
 $ErrorActionPreference = "Stop"
-$Version = "1.0.3"
+$Version = "1.0.4"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProxyScript = Join-Path $ScriptDir "mitm_sni_proxy.py"
 $CertDir = Join-Path $ScriptDir "mitm_certs"
@@ -96,6 +96,174 @@ function Find-OpenSSL {
     return $null
 }
 
+function Update-ProcessPath {
+    $machine = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $user = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = (@($machine, $user) -join ";")
+}
+
+function Install-PythonRuntime {
+    Write-Host "  [*] 未检测到 Python 3.8+，尝试自动安装 Python 3.12..." -ForegroundColor Yellow
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Host "  [*] 使用 winget 安装 Python（约 1-2 分钟）..." -ForegroundColor DarkGray
+        try {
+            Start-Process -FilePath $winget.Source -ArgumentList @(
+                "install", "--id", "Python.Python.3.12", "-e", "--silent",
+                "--accept-package-agreements", "--accept-source-agreements",
+                "--disable-interactivity"
+            ) -WindowStyle Hidden -Wait | Out-Null
+            Update-ProcessPath
+            $found = Find-Python
+            if ($found) { return $found }
+        } catch {
+            Write-Host "  [!] winget 安装失败，改用官方安装包" -ForegroundColor DarkGray
+        }
+    }
+
+    $urls = @(
+        "https://mirrors.huaweicloud.com/python/3.12.7/python-3.12.7-amd64.exe",
+        "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe"
+    )
+    $exe = Join-Path $env:TEMP "python-3.12.7-amd64.exe"
+    $downloaded = $false
+    $oldProgress = $ProgressPreference
+    $ProgressPreference = "SilentlyContinue"
+    try {
+        foreach ($u in $urls) {
+            try {
+                Write-Host "  [*] 下载 $u" -ForegroundColor DarkGray
+                Invoke-WebRequest -Uri $u -OutFile $exe -UseBasicParsing -TimeoutSec 180
+                if ((Test-Path $exe) -and ((Get-Item $exe).Length -gt 10MB)) {
+                    $downloaded = $true
+                    break
+                }
+            } catch {
+                Write-Host "  [!] 下载失败：$($_.Exception.Message)" -ForegroundColor DarkGray
+            }
+        }
+    } finally {
+        $ProgressPreference = $oldProgress
+    }
+    if (-not $downloaded) { return $null }
+
+    Write-Host "  [*] 正在静默安装 Python..." -ForegroundColor Yellow
+    try {
+        Start-Process -FilePath $exe -ArgumentList @(
+            "/quiet", "InstallAllUsers=0", "PrependPath=1",
+            "Include_pip=1", "Include_test=0", "Include_launcher=1"
+        ) -Wait | Out-Null
+    } catch {
+        Write-Host "  [!!] Python 安装程序无法运行：$($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
+    Remove-Item $exe -Force -ErrorAction SilentlyContinue
+    Update-ProcessPath
+    Start-Sleep -Seconds 2
+    return (Find-Python)
+}
+
+function Install-GitForWindows {
+    Write-Host "  [*] 未检测到 openssl，尝试自动安装 Git for Windows..." -ForegroundColor Yellow
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Host "  [*] 使用 winget 安装 Git（约 1-2 分钟）..." -ForegroundColor DarkGray
+        try {
+            Start-Process -FilePath $winget.Source -ArgumentList @(
+                "install", "--id", "Git.Git", "-e", "--silent",
+                "--accept-package-agreements", "--accept-source-agreements",
+                "--disable-interactivity"
+            ) -WindowStyle Hidden -Wait | Out-Null
+            Update-ProcessPath
+            $found = Find-OpenSSL
+            if ($found) { return $found }
+        } catch {
+            Write-Host "  [!] winget 安装失败，改用国内镜像安装包" -ForegroundColor DarkGray
+        }
+    }
+
+    $exe = Join-Path $env:TEMP "Git-64-bit.exe"
+    $downloaded = $false
+    $oldProgress = $ProgressPreference
+    $ProgressPreference = "SilentlyContinue"
+    try {
+        $base = "https://registry.npmmirror.com/-/binary/git-for-windows/"
+        $dirs = Invoke-RestMethod -Uri $base -TimeoutSec 30
+        $versions = foreach ($d in $dirs) {
+            if ($d.type -ne "dir") { continue }
+            if ($d.name -match '^v(\d+\.\d+\.\d+)\.windows\.\d+/?$') {
+                [pscustomobject]@{ Version = [version]$Matches[1]; Dir = $d }
+            }
+        }
+        $latest = $versions | Sort-Object Version | Select-Object -Last 1
+        if (-not $latest) { throw "没有找到可用版本" }
+        $files = Invoke-RestMethod -Uri $latest.Dir.url -TimeoutSec 30
+        $asset = $files | Where-Object { $_.name -match '^Git-.*-64-bit\.exe$' } |
+            Select-Object -First 1
+        if (-not $asset) { throw "没有找到 64 位安装包" }
+        $assetUrl = $asset.url
+        if ($assetUrl -notmatch '^https?://') {
+            $assetUrl = "https://registry.npmmirror.com" + $assetUrl
+        }
+        Write-Host "  [*] 下载 $($asset.name)（约 65 MB）..." -ForegroundColor DarkGray
+        Invoke-WebRequest -Uri $assetUrl -OutFile $exe -UseBasicParsing -TimeoutSec 600
+        if ((Test-Path $exe) -and ((Get-Item $exe).Length -gt 40MB)) {
+            $downloaded = $true
+        }
+    } catch {
+        Write-Host "  [!!] 自动下载 Git 失败：$($_.Exception.Message)" -ForegroundColor Red
+    } finally {
+        $ProgressPreference = $oldProgress
+    }
+    if (-not $downloaded) { return $null }
+
+    Write-Host "  [*] 正在静默安装 Git for Windows..." -ForegroundColor Yellow
+    try {
+        Start-Process -FilePath $exe -ArgumentList @(
+            "/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-",
+            "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"
+        ) -Wait | Out-Null
+    } catch {
+        Write-Host "  [!!] Git 安装程序无法运行：$($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
+    Remove-Item $exe -Force -ErrorAction SilentlyContinue
+    Update-ProcessPath
+    return (Find-OpenSSL)
+}
+
+function Ensure-Dependencies {
+    $py = Find-Python
+    if (-not $py) {
+        Write-Host "  [!] 未检测到 Python，正在自动安装（首次运行需要联网）..." -ForegroundColor Yellow
+        $py = Install-PythonRuntime
+        if (-not $py) {
+            Write-Host "  [!!] Python 自动安装失败，请手动安装 3.8+ 后重试：" -ForegroundColor Red
+            Write-Host "       https://www.python.org/downloads/" -ForegroundColor Yellow
+            return $false
+        }
+        Write-Host "  [OK] Python $($py.Version) 已就绪" -ForegroundColor Green
+    }
+
+    $needCerts = (-not (Test-Path $CaCert)) -or (-not (Test-Path $WildcardCert))
+    if ($needCerts -and -not (Find-OpenSSL)) {
+        Write-Host "  [!] 首次运行需要生成设备证书，正在自动安装 Git for Windows..." -ForegroundColor Yellow
+        $ossl = Install-GitForWindows
+        if (-not $ossl) {
+            Write-Host "  [!!] openssl 自动安装失败，请手动安装 Git for Windows 后重试：" -ForegroundColor Red
+            Write-Host "       https://git-scm.com/download/win" -ForegroundColor Yellow
+            return $false
+        }
+        $env:OPENSSL_EXE = $ossl
+        Write-Host "  [OK] openssl 已就绪" -ForegroundColor Green
+    }
+    return $true
+}
+
 function Get-PortOwner {
     try {
         $conn = Get-NetTCPConnection -LocalPort 8888 -State Listen -ErrorAction SilentlyContinue |
@@ -111,6 +279,8 @@ function Get-PortOwner {
 
 # ---------------- 证书初始化 ----------------
 function Initialize-Certs {
+    if (-not (Ensure-Dependencies)) { return $false }
+
     $py = Find-Python
     if (-not $py) {
         Write-Host "  [!!] 未检测到 Python，无法初始化设备证书" -ForegroundColor Red

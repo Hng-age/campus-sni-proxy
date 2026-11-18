@@ -13,7 +13,7 @@ class ConfigTests(unittest.TestCase):
                          len(set(config.WILDCARD_BASES)))
 
     def test_version_is_103(self):
-        self.assertEqual(config.VERSION, "1.0.3")
+        self.assertEqual(config.VERSION, "1.0.4")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# 校园网 SNI 封锁绕过工具 1.0.3
+# 校园网 SNI 封锁绕过工具 1.0.4
 
 ## 这是什么
 
@@ -23,7 +23,7 @@
 | logs/proxy.log | 运行日志（自动轮转，2 MB × 3 份） |
 | state/ | 系统代理备份、守护标记、守护日志 |
 
-## 项目结构（1.0.3 起）
+## 项目结构（1.0.4 起）
 
 ```
 mitm_sni_proxy.py        入口（兼容原有启动方式）
@@ -45,18 +45,20 @@ proxy_watchdog.ps1       异常退出守护
 python -m unittest discover -s tests -v
 ```
 
-当前包含 12 个单元测试，覆盖域名/证书匹配、线路缓存兼容（旧版二元组自动
-升级为三元组）和并发探测逻辑。测试时可用 `SNI_PROXY_PORT=18888` 启动第二个
+当前包含 15 个单元测试，覆盖域名/证书匹配、线路缓存兼容（旧版二元组自动
+升级为三元组）、并发探测和断连分类。测试时可用 `SNI_PROXY_PORT=18888` 启动第二个
 实例，不影响正在运行的 8888。
 
-## 运行环境（发给别人前务必确认）
+## 运行环境（首次运行会自动补齐）
 
 - Windows 10 / 11
-- **Python 3.8 或更高版本（必装）**，安装时勾选 “Add python.exe to PATH”
-  - 检测方法：打开 cmd 输入 `python --version`，能显示版本号即可
-  - 注意：Microsoft Store 里的 python 只是占位符，不能用，请到 python.org 下载安装
-- **Git for Windows（必装，提供 openssl）**：首次运行需要在本机生成证书
-  - 下载：https://git-scm.com/download/win
+- **Python 3.8 或更高版本**：未检测到时会自动安装 Python 3.12（优先 winget，
+  失败则从华为云/ python.org 下载静默安装）
+  - 手动安装时务必勾选 “Add python.exe to PATH”
+  - Microsoft Store 里的 python 只是占位符，不能用
+- **Git for Windows（提供 openssl）**：首次生成设备证书需要它；未安装时会
+  自动尝试 winget 或国内镜像静默安装
+  - 手动下载：https://git-scm.com/download/win
 - 管理员权限：双击 bat 会自动弹出 UAC，点“是”即可
 - 浏览器建议 Chrome / Edge；Firefox 使用独立证书库，不读系统根证书，
   需手动导入 `mitm_certs/ca_cert.crt`
@@ -64,6 +66,7 @@ python -m unittest discover -s tests -v
   请选择允许，或临时关闭后重试
 - 端口 8888 不能被其他程序占用
 - 必须解压后再运行，不要直接在压缩包里双击
+- 自动安装需要联网；如果自动安装失败，按提示手动安装后重新运行即可
 
 ## 使用方法
 
@@ -78,6 +81,15 @@ python -m unittest discover -s tests -v
   [5] 查状态 + 环境自检 + 连通性测试
   [6] 测速：网络出口检测 + 单/多网络速度对比 + 直连/代理对比（8 秒采样）
   [7] 查看最近 40 行运行日志（错误红色、警告黄色）
+
+## 1.0.4 更新
+
+- **首次运行自动补齐依赖**：未检测到 Python 时自动安装 Python 3.12（优先 winget，
+  失败回退华为云 / python.org 安装包）；首次生成证书缺少 openssl 时自动安装
+  Git for Windows（优先 winget，失败回退国内镜像）。
+- **分发包保持洁净**：不含任何证书、私钥、`logs/`、`state/`、`.git` 或
+  `__pycache__`；每台设备首次运行独立生成证书。
+- 版本号同步为 1.0.4。
 
 ## 1.0.3 安全更新
 
@@ -100,17 +112,17 @@ python -m unittest discover -s tests -v
 
 ## 常见问题
 
-- 提示“未检测到 Python”：按上面运行环境安装 Python，勾选 Add to PATH，重新打开程序
-- 提示需要 openssl / 证书初始化失败：安装 Git for Windows 后重新运行
+- 提示“未检测到 Python”：程序会自动尝试安装；若失败，手动安装 3.8+ 并勾选 Add to PATH
+- 提示需要 openssl / 证书初始化失败：程序会自动尝试安装 Git for Windows；若失败，手动安装后重试
 - 选 [1] 后根证书安装失败：多为安全软件拦截，临时关闭安全软件后重试
 - 代理启动失败：按提示查看 [7] 日志；最常见是 8888 端口被占用
 - 全部网页打不开：本版本已带守护恢复；也可重新打开 bat，会自动恢复上次的代理设置
 - 重启电脑后失效：代理不自启 → 跑 bat 选 [1]
 - 换校区/换网络后很慢：strategies.json 缓存的是原网络的线路，首次访问会重新探测
 - 某个站点始终打不开：可能是该站的 CDN 证书已过期或拒绝一切外来 SNI（例如
-  www.huawei.com 的部分边缘证书已过期，1.0.3 会拒绝这类不安全线路），
+  www.huawei.com 的部分边缘证书已过期，本版本会拒绝这类不安全线路），
   属于硬限制，本工具不会为了可用性放弃证书校验
-- 新增被封锁的网站：编辑 mitm_sni_proxy.py 顶部 BLOCKED_SUFFIXES 列表加后缀
+- 新增被封锁的网站：编辑 `sni_proxy/config.py` 里的 `BLOCKED_SUFFIXES` 列表加后缀
 - 限速说明：本工具不解决带宽限速（那是网关侧按账户限的）
 
 ## 技术备注
