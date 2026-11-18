@@ -3,8 +3,19 @@
 import random
 import socket
 import struct
+import threading
+import time
 
 from .config import SNI_REWRITE, BLOCKED_SUFFIXES, WILDCARD_BASES
+
+# The campus resolver and the public resolvers return different CDN edges for
+# the same host (one set can be half-dead). Querying them in parallel and
+# merging the answers is what makes live.douyin.com reachable reliably.
+DNS_SERVERS = ("223.5.5.5", "114.114.114.114", "119.29.29.29", "180.76.76.76")
+
+_dns_memo = {}
+_dns_memo_lock = threading.Lock()
+_DNS_MEMO_TTL = 30
 
 
 def matches_suffix(domain, suffixes):
@@ -13,10 +24,43 @@ def matches_suffix(domain, suffixes):
     return any(d == s or d.endswith("." + s) for s in suffixes)
 
 
-def resolve_domain(domain):
-    """UDP DNS A record lookup - merge results from 2 public resolvers."""
+def _read_name(data, off):
+    """Decode a (possibly compressed) DNS name; return (name, next_offset)."""
+    labels = []
+    end = None
+    hops = 0
+    while off < len(data) and hops < 32:
+        hops += 1
+        length = data[off]
+        if length == 0:
+            off += 1
+            if end is None:
+                end = off
+            break
+        if length & 0xC0 == 0xC0:
+            if off + 1 >= len(data):
+                break
+            if end is None:
+                end = off + 2
+            off = ((length & 0x3F) << 8) | data[off + 1]
+            continue
+        labels.append(data[off + 1:off + 1 + length].decode("ascii", "ignore"))
+        off += 1 + length
+    return ".".join(labels), (end if end is not None else off)
+
+
+def _udp_lookup(domain):
+    """Ask every resolver in parallel; return (ip_list, cname_list).
+
+    CDN answers are CNAME chains, and the resolver-flattened A records can be
+    a dead pool while the CNAME target still points at the live one
+    (e.g. live.douyin.com -> *.w.cdngslb.com), so targets are returned too.
+    """
+    answers = []
+    lock = threading.Lock()
 
     def query(server):
+        ips, cnames = [], []
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.settimeout(2.5)
@@ -30,54 +74,108 @@ def resolve_domain(domain):
             s.close()
 
             if len(data) < 12 or struct.unpack('>H', data[:2])[0] != qid:
-                return []
+                return ips, cnames
 
-            ips = []
-            pos = 12
-            while pos < len(data):
-                if data[pos] & 0xC0 == 0xC0:
-                    pos += 2
-                elif data[pos] == 0:
-                    pos += 1
-                    break
-                else:
-                    pos += data[pos] + 1
-            pos += 4
-
+            qdcount = struct.unpack('>H', data[4:6])[0]
             ancount = struct.unpack('>H', data[6:8])[0]
+            pos = 12
+            for _ in range(qdcount):
+                _, pos = _read_name(data, pos)
+                pos += 4
+
             for _ in range(ancount):
-                try:
-                    if data[pos] & 0xC0 == 0xC0:
-                        pos += 2
-                    else:
-                        while data[pos] != 0:
-                            pos += data[pos] + 1
-                        pos += 1
-                    rtype = struct.unpack('>H', data[pos:pos + 2])[0]
-                    pos += 8
-                    rdlen = struct.unpack('>H', data[pos:pos + 2])[0]
-                    pos += 2
-                    if rtype == 1:
-                        ips.append('.'.join(str(b) for b in data[pos:pos + 4]))
-                    pos += rdlen
-                except Exception:
+                _, pos = _read_name(data, pos)
+                if pos + 10 > len(data):
                     break
-            return ips
+                rtype, _rclass, _ttl, rdlen = struct.unpack(
+                    ">HHIH", data[pos:pos + 10])
+                pos += 10
+                rdata = pos
+                if rtype == 1 and rdlen == 4:
+                    ips.append('.'.join(str(b) for b in data[rdata:rdata + 4]))
+                elif rtype == 5:
+                    cname, _ = _read_name(data, rdata)
+                    if cname:
+                        cnames.append(cname)
+                pos = rdata + rdlen
         except Exception:
-            return []
+            pass
+        return ips, cnames
+
+    def worker(server):
+        res = query(server)
+        with lock:
+            answers.append(res)
+
+    threads = [threading.Thread(target=worker, args=(srv,), daemon=True)
+               for srv in DNS_SERVERS]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=3)
+
+    ips, cnames = [], []
+    for got_ips, got_cnames in answers:
+        ips.extend(got_ips)
+        cnames.extend(got_cnames)
+    return ips, cnames
+
+
+def resolve_domain(domain):
+    """UDP DNS A lookup: all resolvers in parallel, CNAME targets followed."""
+    now = time.time()
+    with _dns_memo_lock:
+        hit = _dns_memo.get(domain)
+        if hit and now - hit[0] < _DNS_MEMO_TTL:
+            return list(hit[1])
 
     merged = []
     seen = set()
-    for server in ("223.5.5.5", "114.114.114.114"):
-        for ip in query(server):
+
+    def add(ips):
+        for ip in ips:
             if ip not in seen:
                 seen.add(ip)
                 merged.append(ip)
-        if len(merged) >= 8:
+
+    ips, cnames = _udp_lookup(domain)
+    add(ips)
+
+    # follow CNAME targets (one extra level is enough for ByteDance CDNs)
+    visited = {domain}
+    frontier = [c for c in dict.fromkeys(cnames) if c not in visited][:4]
+    for _ in range(2):
+        if not frontier:
             break
+        visited.update(frontier)
+        next_frontier = []
+        threads = []
+        results = []
+        lock = threading.Lock()
+
+        def follow(target):
+            got_ips, got_cnames = _udp_lookup(target)
+            with lock:
+                results.append((got_ips, got_cnames))
+
+        for target in frontier:
+            t = threading.Thread(target=follow, args=(target,), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=3)
+        for got_ips, got_cnames in results:
+            add(got_ips)
+            for c in got_cnames:
+                if c not in visited and c not in next_frontier:
+                    next_frontier.append(c)
+        frontier = next_frontier[:4]
+
     if not merged:
         # campus networks sometimes drop direct UDP/53 to public resolvers
         return resolve_system(domain)
+    with _dns_memo_lock:
+        _dns_memo[domain] = (now, list(merged))
     return merged
 
 

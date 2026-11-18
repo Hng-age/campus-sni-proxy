@@ -13,13 +13,20 @@ from .config import (
     ASSET_COMPAT,
     ASSET_COMPAT_SUFFIXES,
     ATTEMPT_TIMEOUT,
+    CDN_SIBLING_HOSTS,
     NEG_CACHE_TTL,
     SNI_REWRITE,
     STRATEGY_FILE,
     STRICT_UPSTREAM,
 )
-from .logsetup import log, log_error
-from .netutil import bare_domain, cert_covers, matches_suffix, resolve_domain
+from .logsetup import log, log_debug, log_error
+from .netutil import (
+    bare_domain,
+    cert_covers,
+    matches_suffix,
+    resolve_domain,
+    resolve_system,
+)
 from .uplinks import connect_tcp
 
 _strategy_lock = threading.Lock()
@@ -50,6 +57,71 @@ def _client_tls_context():
 
 # domain -> {"endpoints": [(ip, sni, level), ...], "fail_ts": float|None}
 _strategy_cache = {}
+
+# short-lived DNS memo so cache validation does not re-query on every request
+_dns_cache = {}
+_dns_lock = threading.Lock()
+
+
+def _current_ip_set(domain, ttl=60):
+    """Union of system + public DNS answers, memoized for `ttl` seconds."""
+    now = time.time()
+    with _dns_lock:
+        hit = _dns_cache.get(domain)
+        if hit and now - hit[0] < ttl:
+            return set(hit[1])
+    ips = set(resolve_system(domain))
+    ips.update(resolve_domain(domain))
+    with _dns_lock:
+        _dns_cache[domain] = (now, ips)
+    return set(ips)
+
+
+def _drop_stale_endpoints(domain, endpoints):
+    """Discard cached IPs that DNS no longer returns (rotated / wrong edge).
+
+    A stale edge can still complete TLS and answer 404 for the real host,
+    so failure-only invalidation is not enough. Mapped routes legitimately
+    use IPs of the bare domain, so both answer sets are considered.
+    """
+    fresh = _current_ip_set(domain)
+    bare = bare_domain(domain)
+    if bare != domain:
+        fresh |= _current_ip_set(bare)
+    if not fresh:
+        return endpoints
+    kept = [ep for ep in endpoints if ep[0] in fresh]
+    if len(kept) != len(endpoints):
+        log_debug(f"cache prune {domain}: dropped "
+                  f"{len(endpoints) - len(kept)} stale ip(s)")
+    return kept
+
+
+# IPs seen on any blocked-domain edge, most recent first. CDN edge pools are
+# shared between hosts, so a sibling's live IP can rescue a host whose own
+# DNS answers are unreachable.
+_ip_pool = []
+_ip_pool_lock = threading.Lock()
+_IP_POOL_MAX = 48
+_POOL_CANDIDATES = 12
+
+
+def _remember_ips(ips):
+    with _ip_pool_lock:
+        for ip in ips:
+            if not ip:
+                continue
+            try:
+                _ip_pool.remove(ip)
+            except ValueError:
+                pass
+            _ip_pool.insert(0, ip)
+        del _ip_pool[_IP_POOL_MAX:]
+
+
+def _pool_snapshot():
+    with _ip_pool_lock:
+        return list(_ip_pool[:_POOL_CANDIDATES])
 
 
 def try_tls(ip, sni, timeout=ATTEMPT_TIMEOUT, verify_host=None):
@@ -132,14 +204,35 @@ def build_candidates(domain):
     """Build ordered (ip, sni, how) candidate list for a blocked domain.
     CDN IP rotation means we must try several IPs x several SNIs."""
     cands = []
-    own_ips = resolve_domain(domain)
+    own_ips = resolve_system(domain)
+    for ip in resolve_domain(domain):
+        if ip not in own_ips:
+            own_ips.append(ip)
     bare = bare_domain(domain)
-    bare_ips = resolve_domain(bare) if bare != domain else []
+    bare_ips = resolve_system(bare) if bare != domain else []
+    if bare != domain:
+        for ip in resolve_domain(bare):
+            if ip not in bare_ips:
+                bare_ips.append(ip)
+
+    # Edge pools are shared between sibling hosts. When this host's own DNS
+    # answers point at a dead pool (mobile-only edges), the siblings' IPs are
+    # probed with the real SNI; the certificate check rejects wrong edges.
+    for sibling in CDN_SIBLING_HOSTS.get(bare, []):
+        _remember_ips(resolve_system(sibling) + resolve_domain(sibling))
 
     first_sni = SNI_REWRITE.get(domain) or bare
 
+    # 0. own IP + real host SNI: works when the firewall allows the real SNI,
+    #    and avoids wrong-edge 404s (e.g. live.douyin.com)
+    for ip in own_ips[:16]:
+        cands.append((ip, domain, "own+host"))
+    for ip in _pool_snapshot():
+        if ip not in own_ips[:16]:
+            cands.append((ip, domain, "pool+host"))
+
     # 1. own IP + mapped/bare SNI - all resolved IPs (DNS rotation tolerance)
-    for ip in own_ips[:6]:
+    for ip in own_ips[:16]:
         cands.append((ip, first_sni, "own+map"))
 
     # 2. bare IP + bare SNI (own edge is often fully blocked)
@@ -242,11 +335,17 @@ def connect_upstream(domain, port):
     with _strategy_lock:
         entry = _strategy_cache.get(domain)
     if entry:
+        raw_eps = [ep for ep in entry.get("endpoints", []) if ep and ep[0]]
+        eps = _drop_stale_endpoints(domain, raw_eps)
+        if len(eps) != len(raw_eps):
+            entry = {"endpoints": eps, "fail_ts": None}
+            with _strategy_lock:
+                _strategy_cache[domain] = entry
+            save_strategy_cache()
+
         host_cached = []
         chain_cached = []
-        for ep in entry.get("endpoints", []):
-            if not ep or not ep[0]:
-                continue
+        for ep in eps:
             level = ep[2] if len(ep) >= 3 else "chain"
             if level == "host":
                 host_cached.append((ep[0], ep[1], "cache"))
@@ -259,12 +358,14 @@ def connect_upstream(domain, port):
                 verify_host=domain)
             if ssock:
                 ssock.settimeout(None)
+                log(f"  [OK] {domain} via {_ip} SNI={sni} (cache, host)")
                 return ssock, sni
         if chain_cached and allow_chain_route(domain):
             ssock, _ip, sni, _how = probe_first(
                 chain_cached, timeout=3, workers=4, deadline=8)
             if ssock:
                 ssock.settimeout(None)
+                log(f"  [OK] {domain} via {_ip} SNI={sni} (cache, chain)")
                 return ssock, sni
 
         # cached endpoints all dead
@@ -283,18 +384,47 @@ def connect_upstream(domain, port):
         host_snis.add(mapped.lower())
     verified_cands = [c for c in cands if c[1].lower() in host_snis]
 
+    # Phase 1: real hostname SNI only. This avoids a wrong CDN edge that
+    # completes TLS but returns 404 (e.g. live.douyin.com).
+    real_host_cands = [c for c in cands if c[1].lower() == domain.lower()]
+    if real_host_cands:
+        # launch every candidate at once: a single slow IP must not delay the
+        # one good edge (campus drops most IPs with a 2.5s SYN timeout)
+        ssock, ip, sni, how = probe_first(
+            real_host_cands, timeout=ATTEMPT_TIMEOUT,
+            workers=min(32, len(real_host_cands)), deadline=3.5,
+            verify_host=domain)
+        if ssock:
+            ssock.settimeout(None)
+            _remember_ips([ip])
+            with _strategy_lock:
+                entry = _strategy_cache.setdefault(
+                    domain, {"endpoints": [], "fail_ts": None})
+                if not any(ep[0] == ip and ep[1] == sni
+                           for ep in entry["endpoints"]):
+                    entry["endpoints"].insert(0, (ip, sni, "host"))
+                    del entry["endpoints"][5:]
+                entry["fail_ts"] = None
+            save_strategy_cache()
+            log(f"  [OK] {domain} via {ip} SNI={sni} ({how}, host)")
+            return ssock, sni
+
     ssock, ip, sni, how = probe_first(
-        verified_cands, timeout=ATTEMPT_TIMEOUT, workers=8, deadline=6,
+        verified_cands, timeout=ATTEMPT_TIMEOUT,
+        workers=min(20, len(verified_cands)), deadline=8,
         verify_host=domain)
     level = "host"
     if not ssock and allow_chain_route(domain):
         # compatibility fallback: many campus CDN edges return a shared
         # certificate that does not cover the target host
         level = "chain"
-        ssock, ip, sni, how = probe_first(cands, deadline=10)
+        ssock, ip, sni, how = probe_first(
+            cands, timeout=ATTEMPT_TIMEOUT,
+            workers=min(20, len(cands)), deadline=12)
 
     if ssock:
         ssock.settimeout(None)
+        _remember_ips([ip])
         with _strategy_lock:
             entry = _strategy_cache.setdefault(
                 domain, {"endpoints": [], "fail_ts": None})

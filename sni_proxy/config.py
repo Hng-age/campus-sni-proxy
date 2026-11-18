@@ -72,6 +72,17 @@ ALLOWED_SNI_POOL = [
     "www.weibo.com",
 ]
 
+# ByteDance CDN edges are shared between sibling hosts, but the campus/public
+# DNS can return a mobile-only pool that is unreachable here (e.g.
+# live.douyin.com -> 36.248.50.x). These siblings resolve to the live pool;
+# their IPs are probed with the real host SNI, so a wrong edge is rejected by
+# the certificate check instead of returning a 404 page.
+CDN_SIBLING_HOSTS = {
+    "douyin.com": ["i.snssdk.com", "tos-d-x-hl.snssdk.com", "gecko.zijieapi.com"],
+    "iesdouyin.com": ["i.snssdk.com", "tos-d-x-hl.snssdk.com"],
+    "amemv.com": ["i.snssdk.com"],
+}
+
 # Shared multi-SAN wildcard cert: covers each blocked suffix and its
 # one-level subdomains, so new subdomains need no runtime openssl call.
 EXTRA_WILDCARD_BASES = ["mcdn.bilivideo.cn", "mcdn.bilivideo.com"]
@@ -95,7 +106,7 @@ ASSET_COMPAT_SUFFIXES = [
     "douyinvideo.net", "bytecdn.cn", "pstatp.com",
     "hdslb.com", "bilivideo.com", "bilivideo.cn", "acgvideo.com",
     "xhscdn.com", "yximgs.com", "iqiyipic.com", "xmcdn.com",
-    "qpic.cn", "gtimg.cn", "doubanio.com", "ifengimg.com",
+    "qpic.cn", "gtimg.cn", "doubanio.com", "ifengimg.com", "mm.bing.net",
 ]
 
 # openssl: env override (set by proxy_manager.ps1) -> Git for Windows -> PATH
