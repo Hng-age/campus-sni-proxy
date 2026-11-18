@@ -101,8 +101,8 @@ python -m unittest discover -s tests -v
 - **代理存活检测更可靠**：管理器和守护进程不再只看端口是否可连接，而是检查
   监听进程的 PID、进程名和命令行；其他程序占用 8888 时会被识别为代理未运行，
   不会误判为代理存活。
-- **透传域名修复**：非封锁域名改用系统 DNS + OS 默认路由，修复 TRAE CN 相关域名
-  （`www.trae.cn`、`lf-cdn.trae.ai`）以及其他正常站点走代理超时的问题。
+- **透传域名修复**：非封锁域名改用系统 DNS + 多 IP/多出口并发连接，修复 TRAE CN
+  相关域名（`www.trae.cn`、`lf-cdn.trae.ai`）以及其他正常站点走代理超时的问题。
 - **域名后缀边界修复**：`notdouyin.com` 不会再被误判为 `douyin.com` 的子域。
 - **协议与性能修复**：明文 HTTP POST 的请求体会完整转发；DNS 查询使用随机事务 ID
   并在公共 DNS 不可用时回退系统解析；上游 TLS 复用同一个 SSLContext；双向转发

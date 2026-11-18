@@ -11,7 +11,7 @@ from .certs import ensure_identity, generate_site_cert
 from .logsetup import log, log_debug, log_error, log_warning
 from .netutil import is_blocked_domain, matches_suffix, resolve_domain, resolve_system
 from .upstream import connect_upstream, load_strategy_cache
-from .uplinks import connect_any, connect_host_direct, connect_tcp
+from .uplinks import connect_any, connect_tcp
 
 
 def _is_disconnect(exc):
@@ -167,8 +167,7 @@ def handle_passthrough(client_sock, host, port):
         # like a direct connection even when the proxy's default route differs
         server_sock = connect_any(ips, port, timeout=4, deadline=7)
         if server_sock is None:
-            server_sock = connect_host_direct(host, port, timeout=8)
-        if server_sock is None:
+            log_debug(f"passthrough {host}: connect failed ({len(ips)} ips)")
             client_sock.sendall(b"HTTP/1.1 502 Connect Fail\r\n\r\n")
             client_sock.close()
             return
@@ -259,8 +258,7 @@ def handle_http_request(client_sock, request):
 
         server_sock = connect_any(ips, port, timeout=4, deadline=7)
         if server_sock is None:
-            server_sock = connect_host_direct(host, port, timeout=8)
-        if server_sock is None:
+            log_debug(f"http {host}: connect failed ({len(ips)} ips)")
             client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             client_sock.close()
             return

@@ -128,14 +128,6 @@ def connect_tcp_bound(ip, port, src=None, timeout=4):
         return None
 
 
-def connect_host_direct(host, port, timeout=8):
-    """Fallback: let the OS resolver + routing choose, like a direct client."""
-    try:
-        return socket.create_connection((host, port), timeout=timeout)
-    except Exception:
-        return None
-
-
 def connect_any(ips, port, timeout=4, deadline=7):
     """Try every IP x every uplink concurrently; first success wins.
 
@@ -148,7 +140,7 @@ def connect_any(ips, port, timeout=4, deadline=7):
         sources = [None] + list(_uplinks)
     seen = set()
     cands = []
-    for ip in ips[:6]:
+    for ip in ips[:12]:
         for src in sources:
             key = (ip, src)
             if key not in seen:
