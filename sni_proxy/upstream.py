@@ -10,6 +10,8 @@ import time
 
 from .config import (
     ALLOWED_SNI_POOL,
+    ASSET_COMPAT,
+    ASSET_COMPAT_SUFFIXES,
     ATTEMPT_TIMEOUT,
     NEG_CACHE_TTL,
     SNI_REWRITE,
@@ -21,6 +23,15 @@ from .netutil import bare_domain, cert_covers, resolve_domain
 from .uplinks import connect_tcp
 
 _strategy_lock = threading.Lock()
+_save_lock = threading.Lock()
+_asset_suffixes = tuple(ASSET_COMPAT_SUFFIXES)
+
+
+def allow_chain_route(domain):
+    """Chain-only routes are acceptable for static assets in strict mode."""
+    if not STRICT_UPSTREAM:
+        return True
+    return ASSET_COMPAT and domain.lower().endswith(_asset_suffixes)
 
 # domain -> {"endpoints": [(ip, sni, level), ...], "fail_ts": float|None}
 _strategy_cache = {}
@@ -158,9 +169,17 @@ def save_strategy_cache():
                     "fail_ts": entry.get("fail_ts"),
                 }
         tmp = STRATEGY_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, STRATEGY_FILE)
+        with _save_lock:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            for _ in range(3):
+                try:
+                    os.replace(tmp, STRATEGY_FILE)
+                    break
+                except PermissionError:
+                    time.sleep(0.05)
+            else:
+                raise PermissionError("strategy cache is locked by another process")
     except Exception as e:
         log_error(f"save strategy cache failed: {e}")
 
@@ -229,7 +248,7 @@ def connect_upstream(domain, port):
             if ssock:
                 ssock.settimeout(None)
                 return ssock, sni
-        if chain_cached and not STRICT_UPSTREAM:
+        if chain_cached and allow_chain_route(domain):
             ssock, _ip, sni, _how = probe_first(
                 chain_cached, timeout=3, workers=4, deadline=8)
             if ssock:
@@ -256,7 +275,7 @@ def connect_upstream(domain, port):
         verified_cands, timeout=ATTEMPT_TIMEOUT, workers=8, deadline=6,
         verify_host=domain)
     level = "host"
-    if not ssock and not STRICT_UPSTREAM:
+    if not ssock and allow_chain_route(domain):
         # compatibility fallback: many campus CDN edges return a shared
         # certificate that does not cover the target host
         level = "chain"
@@ -277,7 +296,7 @@ def connect_upstream(domain, port):
 
     # sibling rescue: try endpoints cached from other subdomains of the
     # same bare domain (e.g. lf-douyin-pc-web via lf-douyin-pc-web-back)
-    if bare != domain and not STRICT_UPSTREAM:
+    if bare != domain and allow_chain_route(domain):
         with _strategy_lock:
             sib_eps = []
             for d, e in _strategy_cache.items():

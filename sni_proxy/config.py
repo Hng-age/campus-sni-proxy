@@ -84,6 +84,20 @@ WILDCARD_BASES = list(dict.fromkeys(
 # explicitly accept the compatibility trade-off for shared CDN edges.
 STRICT_UPSTREAM = os.environ.get("SNI_STRICT_UPSTREAM", "1") != "0"
 
+# Static asset / CDN domains: chain-valid but hostname-mismatched routes are
+# allowed here even in strict mode, otherwise the page shell loads but its
+# JS/CSS/images return 204 and the UI stays blank. API/document domains are
+# not in this list and remain strictly hostname-verified.
+# Set SNI_ASSET_COMPAT=0 to disable this exception (pure strict mode).
+ASSET_COMPAT = os.environ.get("SNI_ASSET_COMPAT", "1") != "0"
+ASSET_COMPAT_SUFFIXES = [
+    "douyinstatic.com", "douyinpic.com", "douyincdn.com", "douyinvod.com",
+    "douyinvideo.net", "bytecdn.cn", "pstatp.com",
+    "hdslb.com", "bilivideo.com", "bilivideo.cn", "acgvideo.com",
+    "xhscdn.com", "yximgs.com", "iqiyipic.com", "xmcdn.com",
+    "qpic.cn", "gtimg.cn", "doubanio.com", "ifengimg.com",
+]
+
 # openssl: env override (set by proxy_manager.ps1) -> Git for Windows -> PATH
 OPENSSL = os.environ.get("OPENSSL_EXE") or r"C:\Program Files\Git\usr\bin\openssl.exe"
 if not os.path.exists(OPENSSL):

@@ -305,9 +305,12 @@ def main():
     log("=" * 60)
     log(f"  MITM SNI Proxy v{config.VERSION} - Campus Network Bypass")
     log(f"  Listening: {config.LISTEN_HOST}:{config.LISTEN_PORT}")
-    log("  Upstream TLS: certificate chain required"
-        + (" + hostname (strict)" if config.STRICT_UPSTREAM
-           else " + hostname when possible"))
+    if config.STRICT_UPSTREAM:
+        mode = "strict" + (", static assets compat"
+                           if config.ASSET_COMPAT else "")
+        log(f"  Upstream TLS: certificate chain + hostname ({mode})")
+    else:
+        log("  Upstream TLS: certificate chain + hostname when possible")
     log(f"  MITM suffix list: {len(config.BLOCKED_SUFFIXES)} entries")
     log(f"  Allowed SNI pool: {', '.join(config.ALLOWED_SNI_POOL)}")
     log("  Waiting for connections...")
