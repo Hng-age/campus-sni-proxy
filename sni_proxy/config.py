@@ -72,6 +72,26 @@ ALLOWED_SNI_POOL = [
     "www.weibo.com",
 ]
 
+# CDN edge pools are shared only inside the same family. A ByteDance edge
+# completes TLS for *.xiaohongshu.com but then closes the connection, which
+# shows up in browsers as HTTP 000, so pooled IPs must never cross families.
+CDN_FAMILIES = {
+    "bytedance": [
+        "douyin.com", "iesdouyin.com", "douyinpic.com", "douyincdn.com",
+        "douyinvod.com", "douyinstatic.com", "douyinvideo.net",
+        "douyinlives.com", "amemv.com", "bytedance.com", "byted.org",
+        "bytecdn.cn", "snssdk.com", "zijieapi.com", "zijiecdn.com",
+        "toutiao.com", "ixigua.com", "pstatp.com", "doubao.com",
+    ],
+    "bilibili": [
+        "bilibili.com", "biligame.com", "hdslb.com", "biliapi.net",
+        "biliapi.com", "acgvideo.com", "bilivideo.com", "bilivideo.cn",
+        "bvcip.com",
+    ],
+    "xiaohongshu": ["xiaohongshu.com", "xhscdn.com"],
+    "kuaishou": ["kuaishou.com", "yximgs.com"],
+}
+
 # ByteDance CDN edges are shared between sibling hosts, but the campus/public
 # DNS can return a mobile-only pool that is unreachable here (e.g.
 # live.douyin.com -> 36.248.50.x). These siblings resolve to the live pool;

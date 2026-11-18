@@ -13,6 +13,7 @@ from .config import (
     ASSET_COMPAT,
     ASSET_COMPAT_SUFFIXES,
     ATTEMPT_TIMEOUT,
+    CDN_FAMILIES,
     CDN_SIBLING_HOSTS,
     NEG_CACHE_TTL,
     SNI_REWRITE,
@@ -97,31 +98,44 @@ def _drop_stale_endpoints(domain, endpoints):
     return kept
 
 
-# IPs seen on any blocked-domain edge, most recent first. CDN edge pools are
-# shared between hosts, so a sibling's live IP can rescue a host whose own
-# DNS answers are unreachable.
-_ip_pool = []
+# IPs seen on any blocked-domain edge, most recent first, grouped by CDN
+# family. Edge pools are shared between hosts of the same family only: a
+# ByteDance edge answers TLS for *.xiaohongshu.com but then drops the
+# connection (HTTP 000 in browsers), so cross-family reuse is forbidden.
+_ip_pool = {}
 _ip_pool_lock = threading.Lock()
-_IP_POOL_MAX = 48
+_IP_POOL_MAX = 24
 _POOL_CANDIDATES = 12
 
 
-def _remember_ips(ips):
+def _family_of(domain):
+    for family, suffixes in CDN_FAMILIES.items():
+        if matches_suffix(domain, suffixes):
+            return family
+    return None
+
+
+def _remember_ips(ips, family):
+    if not family:
+        return
     with _ip_pool_lock:
+        pool = _ip_pool.setdefault(family, [])
         for ip in ips:
             if not ip:
                 continue
             try:
-                _ip_pool.remove(ip)
+                pool.remove(ip)
             except ValueError:
                 pass
-            _ip_pool.insert(0, ip)
-        del _ip_pool[_IP_POOL_MAX:]
+            pool.insert(0, ip)
+        del pool[_IP_POOL_MAX:]
 
 
-def _pool_snapshot():
+def _pool_snapshot(family):
+    if not family:
+        return []
     with _ip_pool_lock:
-        return list(_ip_pool[:_POOL_CANDIDATES])
+        return list(_ip_pool.get(family, [])[:_POOL_CANDIDATES])
 
 
 def try_tls(ip, sni, timeout=ATTEMPT_TIMEOUT, verify_host=None):
@@ -215,11 +229,14 @@ def build_candidates(domain):
             if ip not in bare_ips:
                 bare_ips.append(ip)
 
-    # Edge pools are shared between sibling hosts. When this host's own DNS
-    # answers point at a dead pool (mobile-only edges), the siblings' IPs are
-    # probed with the real SNI; the certificate check rejects wrong edges.
+    # Edge pools are shared between sibling hosts of the same CDN family.
+    # When this host's own DNS answers point at a dead pool (mobile-only
+    # edges), the siblings' IPs are probed with the real SNI; the certificate
+    # check rejects wrong edges.
+    family = _family_of(domain)
     for sibling in CDN_SIBLING_HOSTS.get(bare, []):
-        _remember_ips(resolve_system(sibling) + resolve_domain(sibling))
+        _remember_ips(resolve_system(sibling) + resolve_domain(sibling),
+                      _family_of(sibling))
 
     first_sni = SNI_REWRITE.get(domain) or bare
 
@@ -227,7 +244,7 @@ def build_candidates(domain):
     #    and avoids wrong-edge 404s (e.g. live.douyin.com)
     for ip in own_ips[:16]:
         cands.append((ip, domain, "own+host"))
-    for ip in _pool_snapshot():
+    for ip in _pool_snapshot(family):
         if ip not in own_ips[:16]:
             cands.append((ip, domain, "pool+host"))
 
@@ -378,6 +395,7 @@ def connect_upstream(domain, port):
     cands = [(ip, sni, how) for ip, sni, how in build_candidates(domain) if ip]
     tried = len(cands)
     bare = bare_domain(domain)
+    family = _family_of(domain)
     host_snis = {domain.lower(), bare.lower()}
     mapped = SNI_REWRITE.get(domain)
     if mapped:
@@ -391,12 +409,12 @@ def connect_upstream(domain, port):
         # launch every candidate at once: a single slow IP must not delay the
         # one good edge (campus drops most IPs with a 2.5s SYN timeout)
         ssock, ip, sni, how = probe_first(
-            real_host_cands, timeout=ATTEMPT_TIMEOUT,
-            workers=min(32, len(real_host_cands)), deadline=3.5,
+            real_host_cands, timeout=2.0,
+            workers=min(32, len(real_host_cands)), deadline=2.5,
             verify_host=domain)
         if ssock:
             ssock.settimeout(None)
-            _remember_ips([ip])
+            _remember_ips([ip], family)
             with _strategy_lock:
                 entry = _strategy_cache.setdefault(
                     domain, {"endpoints": [], "fail_ts": None})
@@ -411,7 +429,7 @@ def connect_upstream(domain, port):
 
     ssock, ip, sni, how = probe_first(
         verified_cands, timeout=ATTEMPT_TIMEOUT,
-        workers=min(20, len(verified_cands)), deadline=8,
+        workers=min(20, len(verified_cands)), deadline=5,
         verify_host=domain)
     level = "host"
     if not ssock and allow_chain_route(domain):
@@ -420,11 +438,11 @@ def connect_upstream(domain, port):
         level = "chain"
         ssock, ip, sni, how = probe_first(
             cands, timeout=ATTEMPT_TIMEOUT,
-            workers=min(20, len(cands)), deadline=12)
+            workers=min(20, len(cands)), deadline=8)
 
     if ssock:
         ssock.settimeout(None)
-        _remember_ips([ip])
+        _remember_ips([ip], family)
         with _strategy_lock:
             entry = _strategy_cache.setdefault(
                 domain, {"endpoints": [], "fail_ts": None})

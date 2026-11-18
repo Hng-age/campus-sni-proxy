@@ -71,6 +71,12 @@ def _server_context(cert_file, key_file):
     return ctx
 
 
+def _drop_server_context(cert_file, key_file):
+    """Forget a context that failed to handshake so the next attempt reloads."""
+    with _server_ctx_lock:
+        _server_ctx_cache.pop((cert_file, key_file), None)
+
+
 def soft_fail_mitm(client_sock, host):
     """Upstream totally dead: complete TLS with browser, answer 204 for everything.
     Page JS treats telemetry endpoints as done; rendering is not affected."""
@@ -123,17 +129,25 @@ def handle_https_mitm(client_sock, host, port):
 
         cert_file, key_file = generate_site_cert(host)
         if not cert_file:
+            log_debug(f"mitm {host}: no certificate available")
             client_sock.close()
             upstream.close()
             return
 
-        server_ctx = _server_context(cert_file, key_file)
-
         try:
+            server_ctx = _server_context(cert_file, key_file)
             tls_client = server_ctx.wrap_socket(client_sock, server_side=True)
-        except ssl.SSLError:
-            upstream.close()
-            return
+        except ssl.SSLError as e:
+            # a cached context can be stale (cert files regenerated); reload once
+            log_debug(f"mitm {host}: client TLS failed ({e}), reloading context")
+            _drop_server_context(cert_file, key_file)
+            try:
+                server_ctx = _server_context(cert_file, key_file)
+                tls_client = server_ctx.wrap_socket(client_sock, server_side=True)
+            except Exception as e2:
+                log_debug(f"mitm {host}: client TLS failed after reload: {e2}")
+                upstream.close()
+                return
 
         forward_bidirectional(tls_client, upstream)
 

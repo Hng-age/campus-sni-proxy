@@ -12,7 +12,9 @@ def setup_logging():
     """Create the rotating file logger (2 MB x 3 backups)."""
     os.makedirs(config.LOG_DIR, exist_ok=True)
     logger = logging.getLogger("sni_proxy")
-    logger.setLevel(logging.INFO)
+    # SNI_DEBUG=1 turns on handshake/route details for troubleshooting
+    logger.setLevel(logging.DEBUG if os.environ.get("SNI_DEBUG") == "1"
+                    else logging.INFO)
     if logger.handlers:
         return logger
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
