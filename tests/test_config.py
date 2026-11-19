@@ -12,8 +12,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(config.WILDCARD_BASES),
                          len(set(config.WILDCARD_BASES)))
 
-    def test_version_is_110(self):
-        self.assertEqual(config.VERSION, "1.1.0")
+    def test_version_is_200(self):
+        self.assertEqual(config.VERSION, "2.0.0")
 
     def test_strict_upstream_default(self):
         self.assertTrue(config.STRICT_UPSTREAM)

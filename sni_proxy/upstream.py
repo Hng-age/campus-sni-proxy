@@ -24,6 +24,7 @@ from .logsetup import log, log_debug, log_error
 from .netutil import (
     bare_domain,
     cert_covers,
+    is_fake_ip,
     matches_suffix,
     resolve_domain,
     resolve_system,
@@ -90,6 +91,10 @@ def _drop_stale_endpoints(domain, endpoints):
     if bare != domain:
         fresh |= _current_ip_set(bare)
     if not fresh:
+        return endpoints
+    # Clash/Surge 的 fake-IP 模式下 DNS 只返回 198.18.x，真实 IP 缓存仍然
+    # 可用；此时按 DNS 结果裁剪会把唯一可用的真实边缘 IP 全部删掉
+    if all(is_fake_ip(ip) for ip in fresh):
         return endpoints
     kept = [ep for ep in endpoints if ep[0] in fresh]
     if len(kept) != len(endpoints):

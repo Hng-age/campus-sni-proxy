@@ -286,7 +286,8 @@ def _file_sha256(path):
 
 def _pem_thumbprint(path):
     """Windows-style SHA-1 thumbprint of the first PEM certificate."""
-    text = open(path, "r", encoding="ascii", errors="ignore").read()
+    with open(path, "r", encoding="ascii", errors="ignore") as f:
+        text = f.read()
     begin = "-----BEGIN CERTIFICATE-----"
     end = "-----END CERTIFICATE-----"
     start = text.index(begin) + len(begin)
@@ -344,7 +345,10 @@ def ensure_identity():
 
 def generate_site_cert(domain):
     ensure_cert_dir()
-    safe = domain.replace("*.", "wildcard_").replace(":", "_")
+    # domain 来自客户端 CONNECT 请求，必须过滤路径分隔符等非法字符，
+    # 否则构造的域名可能把证书文件写到 CERT_DIR 之外
+    safe = domain.replace("*.", "wildcard_")
+    safe = "".join(c if c.isalnum() or c in ".-_" else "_" for c in safe)
     key_file = os.path.join(config.CERT_DIR, f"{safe}.key")
     cert_file = os.path.join(config.CERT_DIR, f"{safe}.crt")
     csr_file = os.path.join(config.CERT_DIR, f"{safe}.csr")

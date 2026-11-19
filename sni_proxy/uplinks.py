@@ -8,6 +8,7 @@ import time
 
 from .config import NO_WINDOW
 from .logsetup import log
+from .netutil import is_fake_ip
 
 _uplinks = []                     # list of source IPs with default routes
 _uplink_lock = threading.Lock()
@@ -32,7 +33,9 @@ def scan_uplinks():
             # "0.0.0.0  0.0.0.0  <gateway>  <interface_ip>  <metric>"
             if len(parts) >= 5 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":
                 src = parts[3]
-                if src.startswith(("127.", "169.254.")):
+                # 排除回环、链路本地，以及 Clash/Surge TUN 的 fake-IP 网关：
+                # 这些地址不是真实出口，绑定为源地址会导致连接直接失败
+                if src.startswith(("127.", "169.254.", "198.18.", "198.19.")):
                     continue
                 if src not in found:
                     found.append(src)
@@ -84,8 +87,13 @@ def bind_sock(sock, uplink):
 def connect_tcp(ip, port, timeout=10):
     """TCP connect with multi-path round-robin and quick failover.
     Returns (sock, uplink_used) or (None, None)."""
-    uplink = next_uplink()
-    order = [uplink] if uplink else [None]
+    if is_fake_ip(ip):
+        # fake-IP 只能交给系统默认路由（TUN）转发，绑定物理网卡源地址会失败
+        uplink = None
+        order = [None]
+    else:
+        uplink = next_uplink()
+        order = [uplink] if uplink else [None]
     if uplink:
         # failover candidates: other uplinks, then unbound
         with _uplink_lock:
@@ -93,6 +101,7 @@ def connect_tcp(ip, port, timeout=10):
         order += others[:1] + [None]
 
     for src in order:
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
@@ -100,10 +109,19 @@ def connect_tcp(ip, port, timeout=10):
             sock.connect((ip, port))
             return sock, src
         except (socket.timeout, TimeoutError):
-            # firewall drop / unreachable target: not the uplink's fault
-            # for the FIRST attempt; try next path anyway
+            # 失败重试前必须关闭，否则每次超时都会泄漏一个 socket 句柄
+            try:
+                if sock:
+                    sock.close()
+            except Exception:
+                pass
             continue
         except OSError:
+            try:
+                if sock:
+                    sock.close()
+            except Exception:
+                pass
             if src:
                 mark_uplink_fail(src)
             continue
@@ -141,7 +159,8 @@ def connect_any(ips, port, timeout=4, deadline=7):
     seen = set()
     cands = []
     for ip in ips[:12]:
-        for src in sources:
+        ip_sources = [None] if is_fake_ip(ip) else sources
+        for src in ip_sources:
             key = (ip, src)
             if key not in seen:
                 seen.add(key)

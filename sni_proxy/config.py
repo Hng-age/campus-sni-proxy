@@ -2,15 +2,23 @@
 
 import os
 import shutil
+import sys
 
-VERSION = "1.1.0"
+VERSION = "2.0.0"
 
 LISTEN_HOST = "127.0.0.1"
 # 允许测试时用环境变量换端口，避免影响正在运行的 8888 实例
 LISTEN_PORT = int(os.environ.get("SNI_PROXY_PORT", "8888"))
 
 # package lives in <root>/sni_proxy, data files live in <root>/
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+    if not os.path.exists(os.path.join(BASE_DIR, "proxy_manager.ps1")):
+        _parent_dir = os.path.dirname(BASE_DIR)
+        if os.path.exists(os.path.join(_parent_dir, "proxy_manager.ps1")):
+            BASE_DIR = _parent_dir
+else:
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CERT_DIR = os.path.join(BASE_DIR, "mitm_certs")
 STRATEGY_FILE = os.path.join(CERT_DIR, "strategies.json")
 LOG_DIR = os.path.join(BASE_DIR, "logs")

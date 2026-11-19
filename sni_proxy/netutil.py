@@ -199,6 +199,16 @@ def bare_domain(domain):
     return '.'.join(parts[-2:]) if len(parts) >= 2 else domain
 
 
+def is_fake_ip(ip):
+    """True for RFC 2544 benchmarking addresses used by Clash/Surge fake-IP.
+
+    When a透明代理 runs in TUN fake-IP mode, DNS answers point at
+    198.18.0.0/15. Such addresses must be routed by the OS through the TUN
+    device and must never be bound to a physical uplink's source address.
+    """
+    return bool(ip) and (ip.startswith("198.18.") or ip.startswith("198.19."))
+
+
 def is_blocked_domain(domain):
     d = domain.lower().rstrip(".")
     if d in SNI_REWRITE:

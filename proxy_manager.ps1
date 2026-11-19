@@ -1,8 +1,19 @@
-﻿﻿# SNI Proxy Manager - 一键启动/停止
+﻿# SNI Proxy Manager - 一键启动/停止
 # 需要管理员权限：双击 bat 会自动请求提权，直接运行本脚本也会自动提权
+# 2.0.0 起：支持 -Action 非交互模式（GUI 调用）；不带参数仍是原命令行菜单
+
+param(
+    [string]$Action = "",
+    [switch]$NonInteractive
+)
 
 $ErrorActionPreference = "Stop"
-$Version = "1.1.0"
+$Version = "2.0.0"
+
+# 非交互模式：让重定向的输出按 UTF-8 编码（GUI 按 UTF-8 读取）
+if ($Action -ne "") {
+    try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
+}
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProxyScript = Join-Path $ScriptDir "mitm_sni_proxy.py"
 $CertDir = Join-Path $ScriptDir "mitm_certs"
@@ -25,6 +36,48 @@ function Test-IsAdmin {
 
 # ---------------- 管理员自检 ----------------
 if (-not (Test-IsAdmin)) {
+    if ($Action -ne "") {
+        # GUI 非交互模式：提权子进程的输出写入临时文件，父进程等待后转发退码。
+        # 注意：-Verb RunAs 走 ShellExecute，不能与 -RedirectStandardOutput /
+        # -RedirectStandardError 同时使用（PowerShell 5.1 会直接报
+        # “Parameter set cannot be resolved”），所以用 cmd 包装器在提权进程
+        # 内部自行落盘，父进程等待结束后回读。
+        $tag = [guid]::NewGuid().ToString("N")
+        $actOut = Join-Path $env:TEMP "sni_action_$tag.out"
+        $actErr = Join-Path $env:TEMP "sni_action_$tag.err"
+        $actCmd = Join-Path $env:TEMP "sni_action_$tag.cmd"
+        $pwshExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+        $innerArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Action `"$Action`""
+        if ($NonInteractive) { $innerArgs += " -NonInteractive" }
+        $cmdLines = @(
+            "@echo off",
+            "`"$pwshExe`" $innerArgs > `"$actOut`" 2> `"$actErr`"",
+            "exit /b %ERRORLEVEL%"
+        )
+        try {
+            Set-Content -Path $actCmd -Value $cmdLines -Encoding OEM
+            $p = Start-Process -FilePath $actCmd -Verb RunAs `
+                -WindowStyle Hidden -Wait -PassThru
+            foreach ($f in @($actOut, $actErr)) {
+                if (Test-Path $f) {
+                    $text = Get-Content $f -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                    if ($text) { Write-Host $text.TrimEnd() }
+                }
+            }
+            exit $p.ExitCode
+        } catch {
+            $native = 0
+            try { $native = [int]$_.Exception.NativeErrorCode } catch { }
+            if ($native -eq 1223 -or $_.Exception.Message -match "取消|cancel") {
+                Write-Host "  [!!] 已取消 UAC 提权，服务未做任何修改。"
+            } else {
+                Write-Host "  [!!] 提权失败：$($_.Exception.Message)"
+            }
+            exit 1
+        } finally {
+            Remove-Item $actCmd, $actOut, $actErr -Force -ErrorAction SilentlyContinue
+        }
+    }
     Write-Host ""
     Write-Host "  [!] 需要管理员权限（安装根证书 / 修改系统代理）" -ForegroundColor Yellow
     Write-Host "      正在请求提权，请在 UAC 弹窗中点击“是”..." -ForegroundColor Yellow
@@ -1087,6 +1140,67 @@ if ((Test-Path $ProxyStateFile) -and -not (Test-ProxyRunning)) {
     Restore-OriginalProxyState
     Write-Host "  [OK] 已恢复启动前的系统代理设置" -ForegroundColor Green
     Start-Sleep -Seconds 1
+}
+
+# ---------------- 非交互模式（GUI 调用，动作与菜单语义一致） ----------------
+if ($Action -ne "") {
+    switch ($Action.ToLower()) {
+        "start" {
+            if (-not (Initialize-Certs)) { Write-Host "  [!!] 设备证书初始化失败"; exit 1 }
+            if (-not (Install-CA)) { Write-Host "  [!!] 根证书安装失败"; exit 1 }
+            if (-not (Start-Proxy)) { Write-Host "  [!!] 代理未启动，已跳过系统代理设置"; exit 1 }
+            Set-SystemProxy
+        }
+        "stop" {
+            Unset-SystemProxy
+            Stop-Proxy
+            Remove-CA
+        }
+        "restart" {
+            Unset-SystemProxy
+            Stop-Proxy
+            if (-not (Initialize-Certs)) { Write-Host "  [!!] 设备证书初始化失败"; exit 1 }
+            if (-not (Install-CA)) { Write-Host "  [!!] 根证书安装失败"; exit 1 }
+            if (-not (Start-Proxy)) { Write-Host "  [!!] 代理未启动"; exit 1 }
+            Set-SystemProxy
+        }
+        "start-proxy" {
+            if (-not (Initialize-Certs)) { exit 1 }
+            if (-not (Start-Proxy)) { exit 1 }
+            Write-Host "  [提示] 请手动把浏览器代理设为 127.0.0.1:8888"
+        }
+        "stop-proxy" {
+            Remove-Item $ActiveFlag -Force -ErrorAction SilentlyContinue
+            Stop-Watchdog
+            Stop-Proxy
+            Restore-OriginalProxyState
+        }
+        "restore-proxy" {
+            Remove-Item $ActiveFlag -Force -ErrorAction SilentlyContinue
+            Stop-Watchdog
+            if (Test-Path $ProxyStateFile) {
+                Restore-OriginalProxyState
+                Write-Host "  [OK] 已从备份恢复系统代理设置"
+            } else {
+                Write-Host "  [!!] 没有可用的系统代理备份，未做任何修改"
+                exit 1
+            }
+        }
+        "install-ca" {
+            if (-not (Initialize-Certs)) { exit 1 }
+            if (-not (Install-CA)) { exit 1 }
+        }
+        "remove-ca" {
+            Remove-CA
+        }
+        "status" { Show-Status }
+        "logs" { Show-Logs }
+        default {
+            Write-Host "  [!!] 未知 Action: $Action"
+            exit 2
+        }
+    }
+    exit 0
 }
 
 # ---------------- 主循环 ----------------
