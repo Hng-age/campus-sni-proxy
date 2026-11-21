@@ -41,7 +41,19 @@ DEFAULT_RULES = {
     ],
     "passthrough_suffixes": [
         "trae.cn", "trae.com.cn", "mchost.guru", "bytednsdoc.com", "bdurl.net",
+        "fe-static.deepseek.com", "cdn.deepseek.com",
     ],
+    # 域名(或后缀) -> 上游备用 TLS 端口：校园网只封 443 时，同一 WAF 常在
+    # 备用端口上完整服务站点（如 chat.deepseek.com -> 8443）
+    "upstream_port_overrides": {
+        "chat.deepseek.com": 8443,
+    },
+    # 域名(或后缀) -> 上游叶子证书 SHA-256：备用端口常提供自签证书，
+    # 无法走链校验，用指纹锁定替代（改证书/被劫持都会被拒）
+    "upstream_cert_pins": {
+        "chat.deepseek.com":
+            "535025736b94bc66bb0c94bd8e1fee4f1ea50e26008db9af07a679d5714b39aa",
+    },
     "sni_rewrite": {
         "www.douyin.com": "douyin.com",
         "www.bilibili.com": "bilibili.com",
@@ -71,6 +83,17 @@ def _normalize_suffix(suffix):
     elif s.startswith("."):
         s = s[1:]
     return s
+
+
+def _normalize_pin(value):
+    """Normalize a SHA-256 pin to 64 lowercase hex chars ('' if invalid)."""
+    p = (value or "").strip().lower()
+    if p.startswith("sha256:"):
+        p = p[len("sha256:"):]
+    p = p.replace(":", "")
+    if len(p) != 64 or any(c not in "0123456789abcdef" for c in p):
+        return ""
+    return p
 
 
 def generate_pac_script(port=8888, blocked_suffixes=None, rewrites=None,
@@ -187,6 +210,10 @@ def load_rules(force=False):
         config.SNI_REWRITE = dict(rules.get("sni_rewrite", {}))
         config.ALLOWED_SNI_POOL = list(rules.get("allowed_sni_pool", []))
         config.PROXY_MODE = rules.get("proxy_mode", "pac")
+        config.UPSTREAM_PORT_OVERRIDES = _clean_port_overrides(
+            rules.get("upstream_port_overrides", {}))
+        config.UPSTREAM_CERT_PINS = _clean_cert_pins(
+            rules.get("upstream_cert_pins", {}))
 
         extra_wc = rules.get("extra_wildcard_bases", config.EXTRA_WILDCARD_BASES)
         config.EXTRA_WILDCARD_BASES = extra_wc
@@ -224,6 +251,10 @@ def save_rules(rules):
         config.SNI_REWRITE = dict(rules.get("sni_rewrite", {}))
         config.ALLOWED_SNI_POOL = list(rules.get("allowed_sni_pool", []))
         config.PROXY_MODE = rules.get("proxy_mode", "pac")
+        config.UPSTREAM_PORT_OVERRIDES = _clean_port_overrides(
+            rules.get("upstream_port_overrides", {}))
+        config.UPSTREAM_CERT_PINS = _clean_cert_pins(
+            rules.get("upstream_cert_pins", {}))
         extra_wc = rules.get("extra_wildcard_bases", config.EXTRA_WILDCARD_BASES)
         config.EXTRA_WILDCARD_BASES = extra_wc
         config.WILDCARD_BASES = list(dict.fromkeys(
@@ -273,6 +304,86 @@ def add_sni_rewrite(host, rewrite_sni):
     rewrites[h] = r
     save_rules(rules)
     return True
+
+
+def _clean_port_overrides(overrides):
+    """Validate a {domain: port} mapping; drop anything invalid."""
+    clean = {}
+    for domain, port in (overrides or {}).items():
+        d = _normalize_suffix(domain)
+        try:
+            p = int(port)
+        except (TypeError, ValueError):
+            continue
+        if d and 1 <= p <= 65535:
+            clean[d] = p
+    return clean
+
+
+def _clean_cert_pins(pins):
+    """Validate a {domain: sha256} mapping; drop anything invalid."""
+    clean = {}
+    for domain, pin in (pins or {}).items():
+        d = _normalize_suffix(domain)
+        p = _normalize_pin(pin)
+        if d and p:
+            clean[d] = p
+    return clean
+
+
+def add_upstream_port_override(domain, port):
+    """Map a domain (exact or suffix) onto an alternate upstream TLS port."""
+    d = _normalize_suffix(domain)
+    if not d:
+        return False
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False
+    if not (1 <= port <= 65535):
+        return False
+    rules = load_rules()
+    overrides = rules.setdefault("upstream_port_overrides", {})
+    overrides[d] = port
+    save_rules(rules)
+    return True
+
+
+def remove_upstream_port_override(domain):
+    """Remove an upstream port override rule."""
+    d = _normalize_suffix(domain)
+    rules = load_rules()
+    overrides = rules.get("upstream_port_overrides", {})
+    if d in overrides:
+        del overrides[d]
+        save_rules(rules)
+        return True
+    return False
+
+
+def add_upstream_cert_pin(domain, pin):
+    """Pin the upstream leaf certificate SHA-256 for a domain."""
+    d = _normalize_suffix(domain)
+    p = _normalize_pin(pin)
+    if not d or not p:
+        return False
+    rules = load_rules()
+    pins = rules.setdefault("upstream_cert_pins", {})
+    pins[d] = p
+    save_rules(rules)
+    return True
+
+
+def remove_upstream_cert_pin(domain):
+    """Remove an upstream certificate pin rule."""
+    d = _normalize_suffix(domain)
+    rules = load_rules()
+    pins = rules.get("upstream_cert_pins", {})
+    if d in pins:
+        del pins[d]
+        save_rules(rules)
+        return True
+    return False
 
 
 def remove_sni_rewrite(host):

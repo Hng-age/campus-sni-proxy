@@ -1,5 +1,6 @@
 """Upstream TLS connection, certificate verification and SNI fallback."""
 
+import hashlib
 import json
 import os
 import queue
@@ -55,6 +56,78 @@ def _client_tls_context():
                 ctx.load_default_certs()
                 _tls_ctx = ctx
     return _tls_ctx
+
+
+_pinned_ctx = None
+_pinned_ctx_lock = threading.Lock()
+
+
+def _pinned_tls_context():
+    """Non-validating context for pinned routes; the fingerprint is checked
+    right after the handshake instead of the certificate chain."""
+    global _pinned_ctx
+    if _pinned_ctx is None:
+        with _pinned_ctx_lock:
+            if _pinned_ctx is None:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                _pinned_ctx = ctx
+    return _pinned_ctx
+
+
+def _lookup_domain_rule(domain, table):
+    """Longest-suffix lookup in a {suffix: value} rules table."""
+    if not table:
+        return None
+    d = (domain or "").lower().rstrip(".")
+    best = None
+    for suffix, value in table.items():
+        s = (suffix or "").strip().lower()
+        if s.startswith("*.") or s.startswith("."):
+            s = s.lstrip("*").lstrip(".")
+        if not s:
+            continue
+        if d == s or d.endswith("." + s):
+            if best is None or len(s) > len(best[0]):
+                best = (s, value)
+    return best[1] if best else None
+
+
+def port_override_for(domain):
+    """Alternate upstream TLS port for a domain, or None.
+
+    Campus firewalls often block TCP/443 to specific edge ranges while the
+    same WAF still serves the complete site on an alternate TLS port
+    (e.g. chat.deepseek.com via its Huawei WAF on 8443).
+    """
+    raw = _lookup_domain_rule(domain, getattr(config, "UPSTREAM_PORT_OVERRIDES", None))
+    if raw is None:
+        return None
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def cert_pin_for(domain):
+    """Pinned SHA-256 (hex) of the upstream leaf cert for a domain, or None.
+
+    Override ports frequently serve a self-signed WAF certificate, so chain
+    and hostname verification cannot pass; the pin keeps the route tamper
+    evident instead.
+    """
+    raw = _lookup_domain_rule(domain, getattr(config, "UPSTREAM_CERT_PINS", None))
+    if not raw:
+        return None
+    p = str(raw).strip().lower()
+    if p.startswith("sha256:"):
+        p = p[len("sha256:"):]
+    p = p.replace(":", "")
+    if len(p) != 64 or any(c not in "0123456789abcdef" for c in p):
+        return None
+    return p
 
 # domain -> {"endpoints": [(ip, sni, level), ...], "fail_ts": float|None}
 _strategy_cache = {}
@@ -142,13 +215,27 @@ def _pool_snapshot(family):
         return list(_ip_pool.get(family, [])[:_POOL_CANDIDATES])
 
 
-def try_tls(ip, sni, timeout=ATTEMPT_TIMEOUT, verify_host=None):
-    """TLS handshake with upstream certificate-chain verification.
-    verify_host: when set, the certificate must also cover this hostname."""
-    sock, uplink = connect_tcp(ip, 443, timeout)
+def try_tls(ip, sni, timeout=ATTEMPT_TIMEOUT, verify_host=None, port=443,
+            pin_sha256=None):
+    """TLS handshake with upstream certificate verification.
+    verify_host: when set, the certificate must also cover this hostname.
+    pin_sha256: when set, the upstream serves a self-signed certificate on an
+    override port; the leaf cert must match this SHA-256 fingerprint and chain
+    verification is skipped (verify_host does not apply to pinned routes)."""
+    sock, uplink = connect_tcp(ip, port, timeout)
     if sock is None:
         return None
     try:
+        if pin_sha256:
+            ssock = _pinned_tls_context().wrap_socket(sock, server_hostname=sni)
+            der = ssock.getpeercert(binary_form=True)
+            if not der or hashlib.sha256(der).hexdigest() != pin_sha256:
+                try:
+                    ssock.close()
+                except Exception:
+                    pass
+                return None
+            return ssock
         ctx = _client_tls_context()
         ssock = ctx.wrap_socket(sock, server_hostname=sni)
         if verify_host:
@@ -172,7 +259,7 @@ def try_tls(ip, sni, timeout=ATTEMPT_TIMEOUT, verify_host=None):
 
 
 def probe_first(candidates, timeout=ATTEMPT_TIMEOUT, workers=12, deadline=12,
-                verify_host=None):
+                verify_host=None, port=443, pin_sha256=None):
     """Probe (ip, sni, how) candidates concurrently; first success wins.
     Returns (ssock, ip, sni, how) or (None, None, None, None)."""
     if not candidates:
@@ -192,7 +279,8 @@ def probe_first(candidates, timeout=ATTEMPT_TIMEOUT, workers=12, deadline=12,
                 ip, sni, how = todo.get(timeout=0.2)
             except queue.Empty:
                 return
-            ssock = try_tls(ip, sni, timeout, verify_host=verify_host)
+            ssock = try_tls(ip, sni, timeout, verify_host=verify_host,
+                            port=port, pin_sha256=pin_sha256)
             if ssock:
                 with result_lock:
                     if winner.is_set():
@@ -339,7 +427,14 @@ def load_strategy_cache():
 def connect_upstream(domain, port):
     """Connect upstream with SNI fallback.
     Returns (ssl_sock, sni_used) or (None, reason)."""
-    if port != 443:
+    # Per-domain overrides from rules.json: an alternate upstream TLS port
+    # plus (for self-signed edges) a pinned certificate fingerprint.
+    pin = cert_pin_for(domain)
+    use_tls = port == 443
+    if use_tls:
+        port = port_override_for(domain) or port
+
+    if not use_tls:
         # plain TCP, no TLS involved
         try:
             ips = resolve_domain(domain)
@@ -377,14 +472,15 @@ def connect_upstream(domain, port):
         if host_cached:
             ssock, _ip, sni, _how = probe_first(
                 host_cached, timeout=3, workers=4, deadline=6,
-                verify_host=domain)
+                verify_host=domain, port=port, pin_sha256=pin)
             if ssock:
                 ssock.settimeout(None)
                 log(f"  [OK] {domain} via {_ip} SNI={sni} (cache, host)")
                 return ssock, sni
         if chain_cached and allow_chain_route(domain):
             ssock, _ip, sni, _how = probe_first(
-                chain_cached, timeout=3, workers=4, deadline=8)
+                chain_cached, timeout=3, workers=4, deadline=8,
+                port=port, pin_sha256=pin)
             if ssock:
                 ssock.settimeout(None)
                 log(f"  [OK] {domain} via {_ip} SNI={sni} (cache, chain)")
@@ -416,7 +512,7 @@ def connect_upstream(domain, port):
         ssock, ip, sni, how = probe_first(
             real_host_cands, timeout=2.0,
             workers=min(32, len(real_host_cands)), deadline=2.5,
-            verify_host=domain)
+            verify_host=domain, port=port, pin_sha256=pin)
         if ssock:
             ssock.settimeout(None)
             _remember_ips([ip], family)
@@ -429,13 +525,13 @@ def connect_upstream(domain, port):
                     del entry["endpoints"][5:]
                 entry["fail_ts"] = None
             save_strategy_cache()
-            log(f"  [OK] {domain} via {ip} SNI={sni} ({how}, host)")
+            log(f"  [OK] {domain} via {ip}:{port} SNI={sni} ({how}, host)")
             return ssock, sni
 
     ssock, ip, sni, how = probe_first(
         verified_cands, timeout=ATTEMPT_TIMEOUT,
         workers=min(20, len(verified_cands)), deadline=5,
-        verify_host=domain)
+        verify_host=domain, port=port, pin_sha256=pin)
     level = "host"
     if not ssock and allow_chain_route(domain):
         # compatibility fallback: many campus CDN edges return a shared
@@ -443,7 +539,8 @@ def connect_upstream(domain, port):
         level = "chain"
         ssock, ip, sni, how = probe_first(
             cands, timeout=ATTEMPT_TIMEOUT,
-            workers=min(20, len(cands)), deadline=8)
+            workers=min(20, len(cands)), deadline=8,
+            port=port, pin_sha256=pin)
 
     if ssock:
         ssock.settimeout(None)
@@ -472,7 +569,8 @@ def connect_upstream(domain, port):
                             sib_eps.append(pair)
         sib_cands = [(ip, sni, "sib") for ip, sni in sib_eps[:6]]
         ssock, ip, sni, _how = probe_first(
-            sib_cands, timeout=3, workers=4, deadline=8)
+            sib_cands, timeout=3, workers=4, deadline=8,
+            port=port, pin_sha256=pin)
         if ssock:
             ssock.settimeout(None)
             with _strategy_lock:

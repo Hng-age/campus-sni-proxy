@@ -19,7 +19,8 @@ class ProbeFirstTests(unittest.TestCase):
         self.old_try = up.try_tls
         self.good = ("10.0.0.1", "good.com")
 
-        def fake(ip, sni, timeout=None, verify_host=None):
+        def fake(ip, sni, timeout=None, verify_host=None, port=443,
+                 pin_sha256=None):
             if (ip, sni) == self.good:
                 return DummySock()
             return None

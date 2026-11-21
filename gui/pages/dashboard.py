@@ -455,6 +455,21 @@ class DashboardPage(Page):
         port = snap.get("listen_addr", "127.0.0.1:8888").split(":")[-1]
         self.card_port.set_value(port, "#A78BFA")
 
+        # 2.1 DNS 解析状态（以前该标签只初始化，永远不会更新）
+        dns = snap.get("dns") or {}
+        if dns.get("ok"):
+            self.item_dns.setText(
+                f"🖧 DNS 解析： 正常（{dns.get('count', 0)} 个 IP）")
+            self.item_dns.setStyleSheet(
+                "color: #34D399; font-size: 10pt; background: transparent;")
+            self.item_dns.setToolTip("、".join(dns.get("ips", [])))
+        else:
+            err = (dns.get("error") or "解析失败").strip()
+            self.item_dns.setText(f"🖧 DNS 解析： 异常（{err[:36]}）")
+            self.item_dns.setStyleSheet(
+                "color: #F87171; font-size: 10pt; background: transparent;")
+            self.item_dns.setToolTip(err)
+
         cert = snap.get("cert", {})
         if cert.get("exists", False):
             trusted = (cert.get("installed_machine") is True

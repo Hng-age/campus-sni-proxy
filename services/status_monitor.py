@@ -2,6 +2,7 @@
 
 import os
 import re
+import socket
 import time
 
 from sni_proxy import config
@@ -117,10 +118,45 @@ def _cached_cert_state():
     return value
 
 
+# DNS 状态查询有网络开销，缓存 30 秒，避免每次 3 秒轮询都发起解析
+_dns_cache = {"ts": 0.0, "value": None}
+_DNS_CACHE_TTL = 30.0
+
+
+def _cached_dns_state():
+    """Host DNS health for the dashboard, cached between status polls."""
+    now = time.time()
+    if (_dns_cache["value"] is not None
+            and now - _dns_cache["ts"] < _DNS_CACHE_TTL):
+        return _dns_cache["value"]
+    host = "www.baidu.com"
+    ips = []
+    error = ""
+    try:
+        infos = socket.getaddrinfo(
+            host, 443, socket.AF_INET, socket.SOCK_STREAM)
+        for info in infos:
+            ip = info[4][0]
+            if ip not in ips:
+                ips.append(ip)
+    except Exception as e:
+        error = str(e)
+    value = {
+        "ok": bool(ips),
+        "host": host,
+        "ips": ips[:4],
+        "count": len(ips),
+        "error": error,
+    }
+    _dns_cache.update(ts=now, value=value)
+    return value
+
+
 def collect_snapshot():
     """One consistent read-only snapshot of everything the GUI shows."""
     snap = {}
     snap["ts"] = time.time()
+    snap["dns"] = _cached_dns_state()
 
     listener_pid = process_manager.find_listener_pid()
     ident = process_manager.proxy_identity(listener_pid)

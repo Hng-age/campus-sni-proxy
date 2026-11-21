@@ -73,6 +73,18 @@ BLOCKED_SUFFIXES = [
 # certificate). Populated from rules.json at startup.
 PASSTHROUGH_SUFFIXES = []
 
+# Per-domain upstream TLS overrides, populated from rules.json at startup:
+#   upstream_port_overrides: alternate upstream TLS port. The campus firewall
+#     blocks TCP/443 to some edges (e.g. the Huawei WAF cluster serving
+#     chat.deepseek.com), while the same WAF still serves the complete site on
+#     an alternate TLS port, so the domain can be mapped onto it.
+#   upstream_cert_pins: SHA-256 pin of the upstream leaf certificate for
+#     domains whose override port serves a self-signed certificate. The pin
+#     replaces chain/hostname verification for that route, so a changed or
+#     intercepted upstream is still detected.
+UPSTREAM_PORT_OVERRIDES = {}
+UPSTREAM_CERT_PINS = {}
+
 # Allowed SNI pool for fallback (the target edge must accept the SNI)
 ALLOWED_SNI_POOL = [
     "www.zhihu.com",
