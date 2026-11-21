@@ -433,12 +433,24 @@ function Get-WinHttpSettingsB64 {
 
 function Restore-WinHttpSettingsB64([string]$b64) {
     $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections"
-    if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
-    if ($b64) {
-        $bytes = [Convert]::FromBase64String($b64)
-        Set-ItemProperty -Path $key -Name WinHttpSettings -Value $bytes -Type Binary
-    } else {
-        Remove-ItemProperty -Path $key -Name WinHttpSettings -ErrorAction SilentlyContinue
+    try {
+        if (-not (Test-Path $key)) { New-Item -Path $key -Force -ErrorAction Stop | Out-Null }
+        if ($b64) {
+            $bytes = [Convert]::FromBase64String($b64)
+            Set-ItemProperty -Path $key -Name WinHttpSettings -Value $bytes -Type Binary -ErrorAction Stop
+        } else {
+            Remove-ItemProperty -Path $key -Name WinHttpSettings -ErrorAction SilentlyContinue
+        }
+        return $true
+    } catch [System.Security.SecurityException] {
+        Write-Host "  [提示] 无管理员权限，WinHTTP 代理设置未恢复（浏览器代理不受影响；全局模式请以管理员身份重试停止）" -ForegroundColor Yellow
+        return $false
+    } catch [System.UnauthorizedAccessException] {
+        Write-Host "  [提示] 无管理员权限，WinHTTP 代理设置未恢复（浏览器代理不受影响；全局模式请以管理员身份重试停止）" -ForegroundColor Yellow
+        return $false
+    } catch {
+        Write-Host "  [提示] WinHTTP 代理设置恢复失败：$($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
     }
 }
 
@@ -503,9 +515,13 @@ function Restore-OriginalProxyState {
     }
 
     if ($hasWinHttp) {
-        Restore-WinHttpSettingsB64 $winHttp
+        [void](Restore-WinHttpSettingsB64 $winHttp)
     } else {
-        netsh winhttp reset proxy | Out-Null
+        if (Test-IsAdmin) {
+            try { netsh winhttp reset proxy 2>$null | Out-Null } catch { }
+        } else {
+            Write-Host "  [提示] 无管理员权限，已跳过 WinHTTP 重置（浏览器代理不受影响；全局模式请以管理员身份重试停止）" -ForegroundColor Yellow
+        }
     }
 }
 
@@ -922,9 +938,19 @@ function Unset-SystemProxy {
     Write-Host "  [*] 正在恢复系统代理..." -ForegroundColor Yellow
     Remove-Item $ActiveFlag -Force -ErrorAction SilentlyContinue
     Stop-Watchdog
-    Restore-OriginalProxyState
+    $restored = $true
+    try {
+        Restore-OriginalProxyState
+    } catch {
+        $restored = $false
+        Write-Host "  [!!] 系统代理恢复未完全成功：$($_.Exception.Message)" -ForegroundColor Yellow
+    }
     Refresh-WinINet
-    Write-Host "  [OK] 系统代理已恢复为启动前的设置" -ForegroundColor Green
+    if ($restored) {
+        Write-Host "  [OK] 系统代理已恢复为启动前的设置" -ForegroundColor Green
+    } else {
+        Write-Host "  [提示] 浏览器代理已按备份恢复；其余项目可稍后用管理员权限重试" -ForegroundColor Yellow
+    }
 }
 
 # ---------------- 界面 ----------------
