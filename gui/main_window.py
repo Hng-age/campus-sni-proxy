@@ -24,6 +24,7 @@ from gui.pages.certificates import CertificatesPage
 from gui.pages.dashboard import DashboardPage
 from gui.pages.diagnostics import DiagnosticsPage
 from gui.pages.logs import LogsPage
+from gui.pages.rules import RulesPage
 from gui.pages.service import ServicePage
 from gui.pages.settings import SettingsPage
 from gui.pages.speedtest import SpeedTestPage
@@ -142,6 +143,7 @@ class MainWindow(QMainWindow):
         self.sidebar = Sidebar(VERSION, self.bg)
         self.sidebar.nav_changed.connect(self._nav)
         self.sidebar.about_clicked.connect(self._show_about)
+        self.sidebar.help_clicked.connect(self._show_help)
         body.addWidget(self.sidebar)
 
         self.stack = QStackedWidget()
@@ -151,12 +153,13 @@ class MainWindow(QMainWindow):
         # ------- pages (order matches sidebar NAV_ITEMS)
         self.dash_page = DashboardPage(self)
         self.service_page = ServicePage(self)
+        self.rules_page = RulesPage(self)
         self.diag_page = DiagnosticsPage(self)
         self.speed_page = SpeedTestPage(self)
         self.logs_page = LogsPage(self)
         self.cert_page = CertificatesPage(self)
         self.settings_page = SettingsPage(self)
-        for p in (self.dash_page, self.service_page, self.diag_page,
+        for p in (self.dash_page, self.service_page, self.rules_page, self.diag_page,
                   self.speed_page, self.logs_page, self.cert_page, self.settings_page):
             self.stack.addWidget(p)
             p.request_action.connect(self._run_action)
@@ -317,6 +320,18 @@ class MainWindow(QMainWindow):
             f"本地监听 {info['listen']}<br><br>"
             f"命令行入口保留（SNI代理_一键启动.bat / start.bat）。")
 
+    def _show_help(self):
+        QMessageBox.information(
+            self, "使用帮助",
+            "・运行管理：启动/停止/重启代理，并接管或恢复系统代理。\n"
+            "・规则管理：一键智能探测阻断域名，自动学习可用的伪装 SNI 与边缘 IP。\n"
+            "・网络诊断：一键检查网络接口、DNS、端口、系统代理与证书状态。\n"
+            "・网络测速：对比直连与本地代理通道的带宽、延迟和抖动。\n"
+            "・日志中心：实时查看运行日志并导出。\n"
+            "・证书管理：查看设备 CA、安装或移除根证书。\n"
+            "・设置中心：主题、玻璃效果、字体、托盘行为与诊断脱敏。\n\n"
+            "如遇异常，可用 SNI代理_一键启动.bat / start.bat 命令行入口恢复环境。")
+
     # --------------------------------------------------------- settings
     def _apply_current_theme(self, settings):
         pal = theme.palette(settings)
@@ -325,6 +340,8 @@ class MainWindow(QMainWindow):
         self.title_bar.set_palette(pal)
         self.sidebar.set_palette(pal)
         self.dash_page.set_palette(pal)
+        if hasattr(self, "rules_page") and hasattr(self.rules_page, "set_palette"):
+            self.rules_page.set_palette(pal)
         if hasattr(self, "speed_page") and hasattr(self.speed_page, "set_palette"):
             self.speed_page.set_palette(pal)
         if hasattr(self.service_page, "log") and hasattr(self.service_page.log, "set_palette"):
@@ -358,6 +375,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         act_quit = menu.addAction("退出")
         act_quit.triggered.connect(self._quit_app)
+        self.tray_menu = menu
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._tray_activated)
         self.tray.setToolTip(f"{APP_NAME} v{VERSION}")

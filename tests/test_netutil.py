@@ -13,6 +13,9 @@ class NetutilTests(unittest.TestCase):
         self.assertEqual(bare_domain("a.b.douyin.com"), "douyin.com")
         self.assertEqual(bare_domain("douyin.com"), "douyin.com")
         self.assertEqual(bare_domain("localhost"), "localhost")
+        # 多级公共后缀不能被截成 edu.cn / co.uk
+        self.assertEqual(bare_domain("www.example.edu.cn"), "example.edu.cn")
+        self.assertEqual(bare_domain("a.foo.co.uk"), "foo.co.uk")
 
     def test_wildcard_covers(self):
         self.assertTrue(wildcard_covers("new.douyin.com"))

@@ -31,9 +31,9 @@ class GuiImportTests(unittest.TestCase):
 
     def test_pages_import(self):
         for name in ("gui.pages.dashboard", "gui.pages.service",
-                     "gui.pages.diagnostics", "gui.pages.speedtest",
-                     "gui.pages.logs", "gui.pages.certificates",
-                     "gui.pages.settings"):
+                     "gui.pages.rules", "gui.pages.diagnostics",
+                     "gui.pages.speedtest", "gui.pages.logs",
+                     "gui.pages.certificates", "gui.pages.settings"):
             with self.subTest(module=name):
                 self._import(name)
 
@@ -44,12 +44,56 @@ class GuiImportTests(unittest.TestCase):
         from gui.main_window import MainWindow
         app = QApplication.instance() or QApplication([])
         win = MainWindow()
-        self.assertEqual(win.stack.count(), 7)
+        self.assertEqual(win.stack.count(), 8)
         for i in range(win.stack.count()):
             win.sidebar.select(i)
             win._nav(i)
             self.assertIsNotNone(win.stack.widget(i))
         win.close()
+
+    def test_probe_worker_delivers_result(self):
+        """回归测试：点击“开始智能探测”后必须正常返回结果而不是退出程序。"""
+        import os
+        import time
+        os.environ["QT_QPA_PLATFORM"] = "offscreen"
+        from PySide6.QtWidgets import QApplication
+        from gui.main_window import MainWindow
+        from services import probe_service
+
+        app = QApplication.instance() or QApplication([])
+        win = MainWindow()
+        page = win.stack.widget(2)
+        original = probe_service.probe_domain_smart
+
+        def fake_probe(domain, on_progress=None):
+            if on_progress:
+                on_progress("fake progress")
+            return {
+                "success": True,
+                "domain": domain,
+                "bare_domain": domain,
+                "best_ip": "1.2.3.4",
+                "best_sni": "www.zhihu.com",
+                "latency_ms": 1.0,
+                "verify_level": "chain",
+                "recommended_suffix": domain,
+            }
+
+        try:
+            probe_service.probe_domain_smart = fake_probe
+            page.inp_probe_domain.setText("example.com")
+            page._start_probe()
+            deadline = time.time() + 5
+            while page._probing and time.time() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
+            self.assertFalse(page._probing, "探测线程未在超时前结束")
+            self.assertIsNotNone(page._current_probe_result)
+            self.assertTrue(page._current_probe_result["success"])
+            self.assertTrue(page.btn_start_probe.isEnabled())
+        finally:
+            probe_service.probe_domain_smart = original
+            win.close()
 
     def test_build_qss_contains_glass_panel(self):
         from gui.theme import build_qss

@@ -8,7 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Version = "2.0.0"
+$Version = "2.1.0"
 
 # 非交互模式：让重定向的输出按 UTF-8 编码（GUI 按 UTF-8 读取）
 if ($Action -ne "") {
@@ -34,14 +34,19 @@ function Test-IsAdmin {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# ---------------- 管理员自检 ----------------
-if (-not (Test-IsAdmin)) {
+# ---------------- 管理员权限细分判断 ----------------
+# 只有显式安装/卸载系统机器级根证书时才必须提权；日常启停代理进程与修改当前用户系统代理免提权
+$adminRequired = $false
+if ($Action -ne "") {
+    $actLower = $Action.ToLower()
+    if ($actLower -in @("install-ca", "remove-ca", "install-ca-machine", "remove-ca-machine")) {
+        $adminRequired = $true
+    }
+}
+
+if ($adminRequired -and (-not (Test-IsAdmin))) {
     if ($Action -ne "") {
         # GUI 非交互模式：提权子进程的输出写入临时文件，父进程等待后转发退码。
-        # 注意：-Verb RunAs 走 ShellExecute，不能与 -RedirectStandardOutput /
-        # -RedirectStandardError 同时使用（PowerShell 5.1 会直接报
-        # “Parameter set cannot be resolved”），所以用 cmd 包装器在提权进程
-        # 内部自行落盘，父进程等待结束后回读。
         $tag = [guid]::NewGuid().ToString("N")
         $actOut = Join-Path $env:TEMP "sni_action_$tag.out"
         $actErr = Join-Path $env:TEMP "sni_action_$tag.err"
@@ -69,7 +74,7 @@ if (-not (Test-IsAdmin)) {
             $native = 0
             try { $native = [int]$_.Exception.NativeErrorCode } catch { }
             if ($native -eq 1223 -or $_.Exception.Message -match "取消|cancel") {
-                Write-Host "  [!!] 已取消 UAC 提权，服务未做任何修改。"
+                Write-Host "  [!!] 已取消 UAC 提权，证书未做任何修改。"
             } else {
                 Write-Host "  [!!] 提权失败：$($_.Exception.Message)"
             }
@@ -79,7 +84,7 @@ if (-not (Test-IsAdmin)) {
         }
     }
     Write-Host ""
-    Write-Host "  [!] 需要管理员权限（安装根证书 / 修改系统代理）" -ForegroundColor Yellow
+    Write-Host "  [!] 此操作需要管理员权限（安装/移除系统根证书）" -ForegroundColor Yellow
     Write-Host "      正在请求提权，请在 UAC 弹窗中点击“是”..." -ForegroundColor Yellow
     try {
         Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList @(
@@ -87,7 +92,6 @@ if (-not (Test-IsAdmin)) {
         ) | Out-Null
     } catch {
         Write-Host "  [!!] 提权被取消，无法继续。" -ForegroundColor Red
-        Write-Host "       请右键 SNI代理_一键启动.bat → 以管理员身份运行。" -ForegroundColor Red
         Read-Host "  按回车退出"
     }
     exit
@@ -509,11 +513,13 @@ function Start-Watchdog {
     Stop-Watchdog
     if (-not (Test-Path $WatchdogScript)) { return }
     try {
-        # 用 WMI 启动，避免守护进程随管理器窗口关闭而退出
-        $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$WatchdogScript`""
-        Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-            CommandLine = $cmd
-        } | Out-Null
+        # 用 WMI 启动，避免守护进程随管理器窗口关闭而退出。
+        # 只设置 ShowWindow=0：实测可保持 PowerShell 存活且不显示任何窗口；
+        # DETACHED_PROCESS 会让 PowerShell 立即退出，不能使用。
+        $cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$WatchdogScript`""
+        $startup = ([wmiclass]"Win32_ProcessStartup").CreateInstance()
+        $startup.ShowWindow = 0
+        ([wmiclass]"Win32_Process").Create($cmd, $null, $startup) | Out-Null
     } catch { }
 }
 
@@ -678,9 +684,12 @@ function Test-CaInstalled {
     if (-not (Test-Path $CaCert)) { return $false }
     try {
         $ca = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($CaCert)
-        $cert = Get-ChildItem Cert:\LocalMachine\Root |
+        $mCert = Get-ChildItem Cert:\LocalMachine\Root -ErrorAction SilentlyContinue |
             Where-Object { $_.Thumbprint -eq $ca.Thumbprint }
-        return ($null -ne $cert)
+        if ($mCert) { return $true }
+        $uCert = Get-ChildItem Cert:\CurrentUser\Root -ErrorAction SilentlyContinue |
+            Where-Object { $_.Thumbprint -eq $ca.Thumbprint }
+        return ($null -ne $uCert)
     } catch {
         return $false
     }
@@ -702,9 +711,15 @@ function Install-CA {
     $caOut = Join-Path $env:TEMP "sni_certutil_out.log"
     $caErr = Join-Path $env:TEMP "sni_certutil_err.log"
     Remove-Item $caOut, $caErr -ErrorAction SilentlyContinue
+
+    $cArgs = @("-addstore", "-f", "Root", "`"$CaCert`"")
+    if (-not (Test-IsAdmin)) {
+        $cArgs = @("-user", "-addstore", "-f", "Root", "`"$CaCert`"")
+    }
+
     try {
         $p = Start-Process -FilePath "certutil.exe" `
-            -ArgumentList @("-addstore", "-f", "Root", "`"$CaCert`"") `
+            -ArgumentList $cArgs `
             -WindowStyle Hidden -Wait -PassThru `
             -RedirectStandardOutput $caOut -RedirectStandardError $caErr
         $code = $p.ExitCode
@@ -852,17 +867,55 @@ function Stop-Proxy {
     }
 }
 
+function Refresh-WinINet {
+    try {
+        $sig = @"
+[DllImport("wininet.dll", SetLastError = true, CharSet=CharSet.Auto)]
+public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
+"@
+        if (-not ([System.Management.Automation.PSTypeName]"ProxyHelper.WinINetNotify").Type) {
+            Add-Type -MemberDefinition $sig -Name "WinINetNotify" -Namespace "ProxyHelper" -PassThru -ErrorAction SilentlyContinue | Out-Null
+        }
+        [ProxyHelper.WinINetNotify]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+        [ProxyHelper.WinINetNotify]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+    } catch { }
+}
+
 function Set-SystemProxy {
+    param([string]$Mode = "")
     Save-OriginalProxyState
-    Write-Host "  [*] 正在设置系统代理 127.0.0.1:8888..." -ForegroundColor Yellow
     $reg = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
-    Set-ItemProperty -Path $reg -Name ProxyServer -Value "127.0.0.1:8888"
-    Set-ItemProperty -Path $reg -Name ProxyEnable -Value 1
-    netsh winhttp set proxy "127.0.0.1:8888" bypass-list="localhost;127.*;10.*;192.168.*" | Out-Null
+
+    if (-not $Mode) {
+        $rulesFile = Join-Path $ScriptDir "rules.json"
+        if (Test-Path $rulesFile) {
+            try {
+                $r = Get-Content $rulesFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                $Mode = $r.proxy_mode
+            } catch { }
+        }
+    }
+    if (-not $Mode) { $Mode = "pac" }
+
+    if ($Mode -eq "pac") {
+        Write-Host "  [*] 正在设置系统代理为 PAC 智能分流 (http://127.0.0.1:8888/proxy.pac)..." -ForegroundColor Yellow
+        Set-ItemProperty -Path $reg -Name AutoConfigURL -Value "http://127.0.0.1:8888/proxy.pac"
+        Set-ItemProperty -Path $reg -Name ProxyEnable -Value 0
+        Remove-ItemProperty -Path $reg -Name ProxyServer -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "  [*] 正在设置系统代理为全局模式 (127.0.0.1:8888)..." -ForegroundColor Yellow
+        Remove-ItemProperty -Path $reg -Name AutoConfigURL -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $reg -Name ProxyServer -Value "127.0.0.1:8888"
+        Set-ItemProperty -Path $reg -Name ProxyEnable -Value 1
+        netsh winhttp set proxy "127.0.0.1:8888" bypass-list="localhost;127.*;10.*;192.168.*" | Out-Null
+    }
+
+    Refresh-WinINet
+
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
     Set-Content -Path $ActiveFlag -Value (Get-Date).ToString("s") -Encoding ASCII
     Start-Watchdog
-    Write-Host "  [OK] 系统代理已开启（异常退出会自动恢复）" -ForegroundColor Green
+    Write-Host "  [OK] 系统代理已开启（$Mode 模式，异常退出会自动恢复）" -ForegroundColor Green
 }
 
 function Unset-SystemProxy {
@@ -870,6 +923,7 @@ function Unset-SystemProxy {
     Remove-Item $ActiveFlag -Force -ErrorAction SilentlyContinue
     Stop-Watchdog
     Restore-OriginalProxyState
+    Refresh-WinINet
     Write-Host "  [OK] 系统代理已恢复为启动前的设置" -ForegroundColor Green
 }
 
@@ -881,13 +935,14 @@ function Show-Menu {
     Write-Host "   校园网 SNI 代理 $Version - 一键管理" -ForegroundColor Cyan
     Write-Host "  ======================================" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "   [1] 启动（初始化证书 + 启代理 + 设系统代理）" -ForegroundColor Green
-    Write-Host "   [2] 停止（删证书 + 杀进程 + 恢复系统代理）" -ForegroundColor Yellow
+    Write-Host "   [1] 启动代理与系统代理（日常免提权秒启）" -ForegroundColor Green
+    Write-Host "   [2] 停止代理并恢复系统设置（保留证书，免提权）" -ForegroundColor Yellow
     Write-Host "   [3] 仅启动代理（不改系统设置）" -ForegroundColor White
     Write-Host "   [4] 仅停止代理（保留证书，恢复系统代理）" -ForegroundColor White
     Write-Host "   [5] 查看状态 / 连通性测试" -ForegroundColor White
     Write-Host "   [6] 测速（网络出口 + 单/多网络 + 代理对比）" -ForegroundColor White
     Write-Host "   [7] 查看运行日志" -ForegroundColor White
+    Write-Host "   [8] 卸载设备根证书（彻底清理）" -ForegroundColor Gray
     Write-Host "   [0] 退出" -ForegroundColor Gray
     Write-Host ""
 }
@@ -1147,39 +1202,50 @@ if ($Action -ne "") {
     switch ($Action.ToLower()) {
         "start" {
             if (-not (Initialize-Certs)) { Write-Host "  [!!] 设备证书初始化失败"; exit 1 }
-            if (-not (Install-CA)) { Write-Host "  [!!] 根证书安装失败"; exit 1 }
+            if (-not (Test-CaInstalled)) {
+                if (-not (Install-CA)) { Write-Host "  [!!] 根证书安装失败"; exit 1 }
+            }
             if (-not (Start-Proxy)) { Write-Host "  [!!] 代理未启动，已跳过系统代理设置"; exit 1 }
             Set-SystemProxy
         }
         "stop" {
             Unset-SystemProxy
             Stop-Proxy
-            Remove-CA
         }
         "restart" {
             Unset-SystemProxy
             Stop-Proxy
             if (-not (Initialize-Certs)) { Write-Host "  [!!] 设备证书初始化失败"; exit 1 }
-            if (-not (Install-CA)) { Write-Host "  [!!] 根证书安装失败"; exit 1 }
+            if (-not (Test-CaInstalled)) {
+                if (-not (Install-CA)) { Write-Host "  [!!] 根证书安装失败"; exit 1 }
+            }
             if (-not (Start-Proxy)) { Write-Host "  [!!] 代理未启动"; exit 1 }
             Set-SystemProxy
+        }
+        "set-proxy" {
+            Set-SystemProxy
+        }
+        "unset-proxy" {
+            Unset-SystemProxy
         }
         "start-proxy" {
             if (-not (Initialize-Certs)) { exit 1 }
             if (-not (Start-Proxy)) { exit 1 }
-            Write-Host "  [提示] 请手动把浏览器代理设为 127.0.0.1:8888"
+            Write-Host "  [提示] 请手动把浏览器代理设为 127.0.0.1:8888 或使用 PAC 脚本"
         }
         "stop-proxy" {
             Remove-Item $ActiveFlag -Force -ErrorAction SilentlyContinue
             Stop-Watchdog
             Stop-Proxy
             Restore-OriginalProxyState
+            Refresh-WinINet
         }
         "restore-proxy" {
             Remove-Item $ActiveFlag -Force -ErrorAction SilentlyContinue
             Stop-Watchdog
             if (Test-Path $ProxyStateFile) {
                 Restore-OriginalProxyState
+                Refresh-WinINet
                 Write-Host "  [OK] 已从备份恢复系统代理设置"
             } else {
                 Write-Host "  [!!] 没有可用的系统代理备份，未做任何修改"
@@ -1206,7 +1272,7 @@ if ($Action -ne "") {
 # ---------------- 主循环 ----------------
 while ($true) {
     Show-Menu
-    $choice = Read-Host "  请选择 (0-7)"
+    $choice = Read-Host "  请选择 (0-8)"
 
     switch ($choice) {
         "1" {
@@ -1217,7 +1283,11 @@ while ($true) {
                 Write-Host "  [!!] 设备证书初始化失败，已中止启动" -ForegroundColor Red
                 continue
             }
-            if (Install-CA) {
+            $caOk = $true
+            if (-not (Test-CaInstalled)) {
+                $caOk = Install-CA
+            }
+            if ($caOk) {
                 if (Start-Proxy) {
                     Set-SystemProxy
                     Write-Host ""
@@ -1233,9 +1303,8 @@ while ($true) {
             Write-Host "  === 停止 ===" -ForegroundColor Cyan
             Unset-SystemProxy
             Stop-Proxy
-            Remove-CA
             Write-Host ""
-            Write-Host "  [完成] 已全部清理。" -ForegroundColor Green
+            Write-Host "  [完成] 代理已停止，系统代理已恢复。" -ForegroundColor Green
         }
         "3" {
             Write-Host ""
@@ -1246,7 +1315,7 @@ while ($true) {
             }
             if (Start-Proxy) {
                 Write-Host ""
-                Write-Host "  [提示] 请手动把浏览器代理设为 127.0.0.1:8888" -ForegroundColor Yellow
+                Write-Host "  [提示] 请手动把浏览器代理设为 127.0.0.1:8888 或使用 PAC 脚本" -ForegroundColor Yellow
             }
         }
         "4" {
@@ -1256,6 +1325,7 @@ while ($true) {
             Stop-Watchdog
             Stop-Proxy
             Restore-OriginalProxyState
+            Refresh-WinINet
             Write-Host "  [OK] 系统代理已恢复" -ForegroundColor Green
         }
         "5" {
@@ -1266,6 +1336,11 @@ while ($true) {
         }
         "7" {
             Show-Logs
+        }
+        "8" {
+            Write-Host ""
+            Write-Host "  === 卸载设备根证书 ===" -ForegroundColor Cyan
+            Remove-CA
         }
         "0" {
             exit

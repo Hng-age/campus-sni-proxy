@@ -1,6 +1,6 @@
 @echo off
 rem =======================================================
-rem  SNI Proxy Desktop 2.0.0 - ×ÀÃæÍ¼ÐÎ°æÆô¶¯Æ÷
+rem  SNI Proxy Desktop 2.1.0 - æ¡Œé¢å›¾å½¢ç‰ˆå¯åŠ¨å™¨
 rem =======================================================
 cd /d "%~dp0"
 title SNI Proxy Desktop
@@ -33,7 +33,7 @@ if not defined PY_EXE (
 )
 
 if not defined PY_EXE (
-    echo   [!!] Î´¼ì²âµ½ Python£¬ÇëÏÈ°²×° Python 3.8+ ²¢¹´Ñ¡ Add python.exe to PATH
+    echo   [!!] æœªæ£€æµ‹åˆ° Pythonï¼Œè¯·å…ˆå®‰è£… Python 3.8+ å¹¶å‹¾é€‰ Add python.exe to PATH
     echo        https://www.python.org/downloads/
     pause
     exit /b 1
@@ -41,7 +41,7 @@ if not defined PY_EXE (
 
 "%PY_EXE%" -c "import PySide6" >nul 2>&1
 if errorlevel 1 (
-    echo   [*] Ê×´ÎÔËÐÐ£ºÕýÔÚ°²×° GUI ÒÀÀµ PySide6...
+    echo   [*] é¦–æ¬¡è¿è¡Œï¼šæ­£åœ¨å®‰è£… GUI ä¾èµ– PySide6...
     "%PY_EXE%" -m pip install --quiet PySide6 2>nul
     if errorlevel 1 (
         "%PY_EXE%" -m pip install --quiet -i https://pypi.tuna.tsinghua.edu.cn/simple PySide6

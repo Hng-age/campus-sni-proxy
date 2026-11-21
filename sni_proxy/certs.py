@@ -2,6 +2,7 @@
 
 import base64
 import ctypes
+import datetime
 import hashlib
 import os
 import shutil
@@ -10,6 +11,15 @@ import threading
 import time
 
 from ctypes import wintypes
+
+try:
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    HAVE_CRYPTOGRAPHY = True
+except ImportError:
+    HAVE_CRYPTOGRAPHY = False
 
 from . import config
 from .config import NO_WINDOW
@@ -208,6 +218,151 @@ def dispose_legacy_private_keys():
     return count
 
 
+def _generate_ca_crypto():
+    """Pure-Python CA generation via cryptography library (no openssl.exe needed)."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "MITM SNI Proxy CA"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "SNI Proxy"),
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
+    ])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_encipherment=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                content_commitment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    with open(config.CA_KEY, "wb") as f:
+        f.write(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ))
+    with open(config.CA_CERT, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+
+def _generate_wildcard_crypto():
+    """Pure-Python multi-SAN wildcard generation via cryptography library."""
+    with open(config.CA_KEY, "rb") as f:
+        ca_key = serialization.load_pem_private_key(f.read(), password=None)
+    with open(config.CA_CERT, "rb") as f:
+        ca_cert = x509.load_pem_x509_certificate(f.read())
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "SNI Proxy Wildcard"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "SNI Proxy"),
+    ])
+
+    san_list = []
+    for b in config.WILDCARD_BASES:
+        san_list.append(x509.DNSName(b))
+        san_list.append(x509.DNSName(f"*.{b}"))
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.KeyUsage(
+            digital_signature=True, key_encipherment=True,
+            key_cert_sign=False, crl_sign=False, content_commitment=False,
+            data_encipherment=False, key_agreement=False,
+            encipher_only=False, decipher_only=False
+        ), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(x509.SubjectAlternativeName(san_list), critical=False)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    with open(config.WILDCARD_KEY, "wb") as f:
+        f.write(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ))
+    with open(config.WILDCARD_CERT, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+
+def _generate_site_cert_crypto(domain, key_file, cert_file):
+    """Pure-Python on-demand site certificate generation via cryptography library."""
+    with open(config.CA_KEY, "rb") as f:
+        ca_key = serialization.load_pem_private_key(f.read(), password=None)
+    with open(config.CA_CERT, "rb") as f:
+        ca_cert = x509.load_pem_x509_certificate(f.read())
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, domain),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "SNI Proxy"),
+    ])
+
+    san_list = [x509.DNSName(domain)]
+    if not domain.startswith("*."):
+        san_list.append(x509.DNSName(f"*.{domain}"))
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.KeyUsage(
+            digital_signature=True, key_encipherment=True,
+            key_cert_sign=False, crl_sign=False, content_commitment=False,
+            data_encipherment=False, key_agreement=False,
+            encipher_only=False, decipher_only=False
+        ), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(x509.SubjectAlternativeName(san_list), critical=False)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    with open(key_file, "wb") as f:
+        f.write(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ))
+    with open(cert_file, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+
 def generate_ca():
     ensure_cert_dir()
     if os.path.exists(config.CA_KEY) and os.path.exists(config.CA_CERT):
@@ -215,14 +370,17 @@ def generate_ca():
 
     log("  [*] Generating per-device CA certificate...")
     try:
-        subprocess.run([config.OPENSSL, "genrsa", "-out", config.CA_KEY, "2048"],
-                       capture_output=True, check=True, creationflags=NO_WINDOW)
-        subprocess.run(
-            [config.OPENSSL, "req", "-x509", "-new", "-nodes",
-             "-key", config.CA_KEY, "-sha256", "-days", "3650",
-             "-out", config.CA_CERT,
-             "-subj", "/CN=MITM SNI Proxy CA/O=SNI Proxy/C=CN"],
-            capture_output=True, check=True, creationflags=NO_WINDOW)
+        if HAVE_CRYPTOGRAPHY:
+            _generate_ca_crypto()
+        else:
+            subprocess.run([config.OPENSSL, "genrsa", "-out", config.CA_KEY, "2048"],
+                           capture_output=True, check=True, creationflags=NO_WINDOW)
+            subprocess.run(
+                [config.OPENSSL, "req", "-x509", "-new", "-nodes",
+                 "-key", config.CA_KEY, "-sha256", "-days", "3650",
+                 "-out", config.CA_CERT,
+                 "-subj", "/CN=MITM SNI Proxy CA/O=SNI Proxy/C=CN"],
+                capture_output=True, check=True, creationflags=NO_WINDOW)
     except Exception as e:
         log_error(f"CA generation failed: {e}")
         raise
@@ -240,40 +398,44 @@ def generate_wildcard():
     if not (os.path.exists(config.CA_KEY) and os.path.exists(config.CA_CERT)):
         return False
 
-    ext_file = os.path.join(config.CERT_DIR, "_wildcard.ext")
-    csr_file = os.path.join(config.CERT_DIR, "_wildcard.csr")
-    sans = ",".join("DNS:%s,DNS:*.%s" % (b, b) for b in config.WILDCARD_BASES)
     log("  [*] Generating shared wildcard certificate...")
     try:
-        subprocess.run([config.OPENSSL, "genrsa", "-out", config.WILDCARD_KEY, "2048"],
-                       capture_output=True, check=True, creationflags=NO_WINDOW)
-        subprocess.run(
-            [config.OPENSSL, "req", "-new", "-key", config.WILDCARD_KEY,
-             "-out", csr_file, "-subj", "/CN=SNI Proxy Wildcard/O=SNI Proxy"],
-            capture_output=True, check=True, creationflags=NO_WINDOW)
-        with open(ext_file, "w") as f:
-            f.write("basicConstraints=CA:FALSE\n")
-            f.write("keyUsage=digitalSignature,keyEncipherment\n")
-            f.write("extendedKeyUsage=serverAuth\n")
-            f.write(f"subjectAltName={sans}\n")
-        subprocess.run(
-            [config.OPENSSL, "x509", "-req", "-in", csr_file,
-             "-CA", config.CA_CERT, "-CAkey", config.CA_KEY, "-CAcreateserial",
-             "-out", config.WILDCARD_CERT, "-days", "365", "-sha256",
-             "-extfile", ext_file],
-            capture_output=True, check=True, creationflags=NO_WINDOW)
+        if HAVE_CRYPTOGRAPHY:
+            _generate_wildcard_crypto()
+        else:
+            ext_file = os.path.join(config.CERT_DIR, "_wildcard.ext")
+            csr_file = os.path.join(config.CERT_DIR, "_wildcard.csr")
+            sans = ",".join("DNS:%s,DNS:*.%s" % (b, b) for b in config.WILDCARD_BASES)
+            try:
+                subprocess.run([config.OPENSSL, "genrsa", "-out", config.WILDCARD_KEY, "2048"],
+                               capture_output=True, check=True, creationflags=NO_WINDOW)
+                subprocess.run(
+                    [config.OPENSSL, "req", "-new", "-key", config.WILDCARD_KEY,
+                     "-out", csr_file, "-subj", "/CN=SNI Proxy Wildcard/O=SNI Proxy"],
+                    capture_output=True, check=True, creationflags=NO_WINDOW)
+                with open(ext_file, "w") as f:
+                    f.write("basicConstraints=CA:FALSE\n")
+                    f.write("keyUsage=digitalSignature,keyEncipherment\n")
+                    f.write("extendedKeyUsage=serverAuth\n")
+                    f.write(f"subjectAltName={sans}\n")
+                subprocess.run(
+                    [config.OPENSSL, "x509", "-req", "-in", csr_file,
+                     "-CA", config.CA_CERT, "-CAkey", config.CA_KEY, "-CAcreateserial",
+                     "-out", config.WILDCARD_CERT, "-days", "365", "-sha256",
+                     "-extfile", ext_file],
+                    capture_output=True, check=True, creationflags=NO_WINDOW)
+            finally:
+                for f in (ext_file, csr_file):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
         harden_key_acl(config.WILDCARD_KEY)
         log(f"  [OK] wildcard cert: {config.WILDCARD_CERT}")
         return True
     except Exception as e:
         log_error(f"wildcard cert generation failed: {e}")
         return False
-    finally:
-        for f in (ext_file, csr_file):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
 
 
 def _file_sha256(path):
@@ -373,37 +535,40 @@ def generate_site_cert(domain):
         if os.path.exists(key_file) and os.path.exists(cert_file):
             return cert_file, key_file
         try:
-            subprocess.run([config.OPENSSL, "genrsa", "-out", key_file, "2048"],
-                           capture_output=True, check=True, timeout=15,
-                           creationflags=NO_WINDOW)
-            subprocess.run(
-                [config.OPENSSL, "req", "-new", "-key", key_file,
-                 "-out", csr_file, "-subj", f"/CN={domain}/O=SNI Proxy"],
-                capture_output=True, check=True, timeout=15,
-                creationflags=NO_WINDOW)
+            if HAVE_CRYPTOGRAPHY:
+                _generate_site_cert_crypto(domain, key_file, cert_file)
+            else:
+                subprocess.run([config.OPENSSL, "genrsa", "-out", key_file, "2048"],
+                               capture_output=True, check=True, timeout=15,
+                               creationflags=NO_WINDOW)
+                subprocess.run(
+                    [config.OPENSSL, "req", "-new", "-key", key_file,
+                     "-out", csr_file, "-subj", f"/CN={domain}/O=SNI Proxy"],
+                    capture_output=True, check=True, timeout=15,
+                    creationflags=NO_WINDOW)
 
-            sans = f"DNS:{domain}"
-            if not domain.startswith("*."):
-                sans += f",DNS:*.{domain}"
-            with open(ext_file, "w") as f:
-                f.write("basicConstraints=CA:FALSE\n")
-                f.write("keyUsage=digitalSignature,keyEncipherment\n")
-                f.write("extendedKeyUsage=serverAuth\n")
-                f.write(f"subjectAltName={sans}\n")
+                sans = f"DNS:{domain}"
+                if not domain.startswith("*."):
+                    sans += f",DNS:*.{domain}"
+                with open(ext_file, "w") as f:
+                    f.write("basicConstraints=CA:FALSE\n")
+                    f.write("keyUsage=digitalSignature,keyEncipherment\n")
+                    f.write("extendedKeyUsage=serverAuth\n")
+                    f.write(f"subjectAltName={sans}\n")
 
-            subprocess.run(
-                [config.OPENSSL, "x509", "-req", "-in", csr_file,
-                 "-CA", config.CA_CERT, "-CAkey", config.CA_KEY, "-CAcreateserial",
-                 "-out", cert_file, "-days", "365", "-sha256",
-                 "-extfile", ext_file],
-                capture_output=True, check=True, timeout=15,
-                creationflags=NO_WINDOW)
+                subprocess.run(
+                    [config.OPENSSL, "x509", "-req", "-in", csr_file,
+                     "-CA", config.CA_CERT, "-CAkey", config.CA_KEY, "-CAcreateserial",
+                     "-out", cert_file, "-days", "365", "-sha256",
+                     "-extfile", ext_file],
+                    capture_output=True, check=True, timeout=15,
+                    creationflags=NO_WINDOW)
 
-            try:
-                os.remove(csr_file)
-                os.remove(ext_file)
-            except OSError:
-                pass
+                try:
+                    os.remove(csr_file)
+                    os.remove(ext_file)
+                except OSError:
+                    pass
             harden_key_acl(key_file)
             _cert_fail.pop(domain, None)
             return cert_file, key_file

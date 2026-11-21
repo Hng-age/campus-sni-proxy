@@ -1,4 +1,4 @@
-"""SNI Proxy Desktop - 校园网 SNI 代理 GUI 入口（v2.0.0）。
+"""SNI Proxy Desktop - 校园网 SNI 代理 GUI 入口（v2.1.0）。
 
 用法：
     python main.py              启动桌面 GUI

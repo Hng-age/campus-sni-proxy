@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 LISTEN_HOST = "127.0.0.1"
 # 允许测试时用环境变量换端口，避免影响正在运行的 8888 实例
@@ -68,6 +68,10 @@ BLOCKED_SUFFIXES = [
     "huawei.com",
     "bing.com", "bing.net", "cn.bing.com",
 ]
+
+# Routed through the proxy but tunneled without MITM (upstream keeps its own
+# certificate). Populated from rules.json at startup.
+PASSTHROUGH_SUFFIXES = []
 
 # Allowed SNI pool for fallback (the target edge must accept the SNI)
 ALLOWED_SNI_POOL = [
@@ -147,3 +151,13 @@ NEG_CACHE_TTL = 300     # remember failed domains for 5 min
 
 # subprocess flags: never flash console windows (pythonw + console exe)
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+PROXY_MODE = "pac"
+RULES_FILE = os.path.join(BASE_DIR, "rules.json")
+PAC_FILE = os.path.join(BASE_DIR, "state", "proxy.pac")
+
+try:
+    from . import rules_manager
+    rules_manager.load_rules()
+except Exception:
+    pass

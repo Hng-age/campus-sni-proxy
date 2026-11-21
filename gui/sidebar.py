@@ -15,11 +15,12 @@ from PySide6.QtWidgets import (
 NAV_ITEMS = [
     ("🏠", "仪表盘", "Dashboard"),
     ("⚙", "运行管理", "Service Manager"),
+    ("📋", "规则管理", "Rules & Probe"),
     ("🌐", "网络诊断", "Network Diagnostics"),
     ("⚡", "网络测速", "Speed Test"),
     ("📄", "日志中心", "Log Center"),
     ("🛡", "证书管理", "Certificate Manager"),
-    ("⚙", "设置中心", "Settings"),
+    ("🔧", "设置中心", "Settings"),
 ]
 
 
@@ -29,7 +30,7 @@ class BrandLogoWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_StyledBackground, False)
-        self.setFixedSize(56, 56)
+        self.setFixedSize(46, 46)
         self._is_light = False
 
     def set_palette(self, pal):
@@ -122,7 +123,7 @@ class NavButton(QPushButton):
         super().__init__(parent)
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedHeight(42)
+        self.setFixedHeight(38)
         self.glyph = glyph
         self.title_cn = title_cn
         self.title_en = title_en
@@ -147,7 +148,7 @@ class NavButton(QPushButton):
             grad.setColorAt(1.0, QColor(59, 130, 246))
             p.setBrush(QBrush(grad))
             p.setPen(QPen(QColor(147, 197, 253, 180) if self._is_light else QColor(56, 189, 248, 160), 1.2))
-            p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 12, 12)
+            p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 10, 10)
         elif is_hover:
             if self._is_light:
                 p.setBrush(QColor(37, 99, 235, 25))
@@ -155,13 +156,13 @@ class NavButton(QPushButton):
             else:
                 p.setBrush(QColor(30, 58, 138, 80))
                 p.setPen(QPen(QColor(59, 130, 246, 70), 1.0))
-            p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 12, 12)
+            p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 10, 10)
         else:
             p.setBrush(Qt.NoBrush)
             p.setPen(Qt.NoPen)
 
         # 2. Icon glyph
-        p.setFont(QFont("Segoe UI Emoji", 14))
+        p.setFont(QFont("Segoe UI Emoji", 13))
         if is_active:
             glyph_col = QColor("#FFFFFF")
         elif self._is_light:
@@ -169,10 +170,10 @@ class NavButton(QPushButton):
         else:
             glyph_col = QColor("#94A3B8")
         p.setPen(glyph_col)
-        p.drawText(QRectF(14, 0, 28, h), Qt.AlignCenter, self.glyph)
+        p.drawText(QRectF(12, 0, 26, h), Qt.AlignCenter, self.glyph)
 
         # 3. Text lines
-        p.setFont(QFont("Microsoft YaHei UI", 9.5, QFont.Bold if is_active else QFont.Normal))
+        p.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold if is_active else QFont.Normal))
         if is_active:
             title_col = QColor("#FFFFFF")
         elif self._is_light:
@@ -180,9 +181,9 @@ class NavButton(QPushButton):
         else:
             title_col = QColor("#E2E8F0")
         p.setPen(title_col)
-        p.drawText(QRectF(44, 4, w - 50, 18), Qt.AlignLeft | Qt.AlignVCenter, self.title_cn)
+        p.drawText(QRectF(40, 2, w - 46, 18), Qt.AlignLeft | Qt.AlignVCenter, self.title_cn)
 
-        p.setFont(QFont("Segoe UI", 8))
+        p.setFont(QFont("Segoe UI", 7.5))
         if is_active:
             sub_col = QColor("#DBEAFE")
         elif self._is_light:
@@ -190,7 +191,7 @@ class NavButton(QPushButton):
         else:
             sub_col = QColor("#64748B")
         p.setPen(sub_col)
-        p.drawText(QRectF(44, 22, w - 50, 15), Qt.AlignLeft | Qt.AlignVCenter, self.title_en)
+        p.drawText(QRectF(40, 20, w - 46, 14), Qt.AlignLeft | Qt.AlignVCenter, self.title_en)
 
         p.end()
 
@@ -210,13 +211,13 @@ class Sidebar(QFrame):
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
 
         v = QVBoxLayout(self)
-        v.setContentsMargins(10, 10, 10, 8)
-        v.setSpacing(3)
+        v.setContentsMargins(8, 8, 8, 6)
+        v.setSpacing(2)
 
         # 1. Top Brand Logo & Name
         brand = QVBoxLayout()
         brand.setAlignment(Qt.AlignCenter)
-        brand.setSpacing(2)
+        brand.setSpacing(1)
 
         self.logo = BrandLogoWidget()
         brand.addWidget(self.logo, 0, Qt.AlignCenter)
@@ -224,16 +225,16 @@ class Sidebar(QFrame):
         self.name_lab = QLabel("SNI Proxy\nDesktop")
         self.name_lab.setAlignment(Qt.AlignCenter)
         self.name_lab.setStyleSheet(
-            "color: #FFFFFF; font-size: 13pt; font-weight: 700; line-height: 1.1; background: transparent;")
+            "color: #FFFFFF; font-size: 12pt; font-weight: 700; line-height: 1.1; background: transparent;")
         self.ver_lab = QLabel(f"v{version}")
         self.ver_lab.setAlignment(Qt.AlignCenter)
         self.ver_lab.setStyleSheet(
-            "color: #38BDF8; font-size: 8.5pt; font-weight: 600; margin-bottom: 2px; background: transparent;")
+            "color: #38BDF8; font-size: 8pt; font-weight: 600; margin-bottom: 2px; background: transparent;")
 
         brand.addWidget(self.name_lab)
         brand.addWidget(self.ver_lab)
         v.addLayout(brand)
-        v.addSpacing(6)
+        v.addSpacing(3)
 
         # 2. Nav buttons
         self.group = QButtonGroup(self)
@@ -259,8 +260,8 @@ class Sidebar(QFrame):
             }
         """)
         tc_lay = QHBoxLayout(self.tool_card)
-        tc_lay.setContentsMargins(12, 10, 12, 10)
-        tc_lay.setSpacing(10)
+        tc_lay.setContentsMargins(10, 6, 10, 6)
+        tc_lay.setSpacing(8)
 
         self.cap_icon = QLabel("🎓")
         self.cap_icon.setStyleSheet(

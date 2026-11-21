@@ -29,6 +29,12 @@ def _check_env_python():
 
 
 def _check_env_openssl():
+    try:
+        import cryptography
+        crypto_ver = getattr(cryptography, "__version__", "")
+    except ImportError:
+        crypto_ver = None
+
     exe = config.OPENSSL
     if not os.path.exists(exe):
         try:
@@ -36,13 +42,22 @@ def _check_env_openssl():
             exe = shutil.which("openssl") or exe
         except Exception:
             pass
-    if not os.path.exists(exe):
-        return ("OpenSSL 运行环境", "warn",
-                "未检测到 openssl：已有证书可用，但新域名证书无法生成"
-                "（安装 Git for Windows 可解决）")
+    has_exe = os.path.exists(exe)
+
+    if crypto_ver:
+        detail = f"Python cryptography {crypto_ver}（纯代码内置，无需 Git / OpenSSL 外部依赖）"
+        if has_exe:
+            code, out, _ = run_hidden([exe, "version"], timeout=5)
+            ossl_ver = out.strip().splitlines()[0] if (code == 0 and out.strip()) else "已就绪"
+            detail += f" · 外部 OpenSSL 备用: {ossl_ver}"
+        return ("证书生成与加密引擎", "ok", detail)
+
+    if not has_exe:
+        return ("证书生成与加密引擎", "warn",
+                "未检测到 cryptography 或 openssl：已有证书可用，但新域名证书无法生成")
     code, out, _ = run_hidden([exe, "version"], timeout=10)
     ver = out.strip().splitlines()[0] if out.strip() else "未知版本"
-    return ("OpenSSL 运行环境", "ok" if code == 0 else "warn", f"{ver}（{exe}）")
+    return ("证书生成与加密引擎", "ok" if code == 0 else "warn", f"OpenSSL CLI: {ver}（{exe}）")
 
 
 def _check_interfaces():

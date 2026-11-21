@@ -9,7 +9,8 @@ import threading
 from . import config
 from .certs import ensure_identity, generate_site_cert
 from .logsetup import log, log_debug, log_error, log_warning
-from .netutil import is_blocked_domain, matches_suffix, resolve_domain, resolve_system
+from .netutil import (is_blocked_domain, is_passthrough_domain, matches_suffix,
+                      resolve_domain, resolve_system)
 from .upstream import connect_upstream, load_strategy_cache
 from .uplinks import connect_any, connect_tcp
 
@@ -39,12 +40,21 @@ def pump(src, dst):
 
 
 def forward_bidirectional(a, b):
-    # one extra thread instead of two; whichever direction ends first
-    # closes both sockets so the other side unblocks
+    # Enable TCP_NODELAY for lower latency and smoother streaming
+    for s in (a, b):
+        try:
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
     t = threading.Thread(target=pump, args=(a, b), daemon=True)
     t.start()
     pump(b, a)
     for s in (a, b):
+        try:
+            s.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
         try:
             s.close()
         except Exception:
@@ -303,8 +313,39 @@ def handle_client(client_sock, addr):
         client_sock.settimeout(None)
 
         first_line = request.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+        parts = first_line.split()
+        method = parts[0] if parts else ""
+        raw_target = parts[1] if len(parts) > 1 else ""
+
+        # 智能 PAC 分流分发服务：浏览器或系统拉取 PAC 脚本。
+        # 只接受 origin-form 路径（以 / 开头），否则全局代理模式下访问
+        # 任意 http://host/pac 都会被错误地替换成本地 PAC 脚本。
+        if method == "GET" and raw_target.startswith("/") and (
+            raw_target in ("/proxy.pac", "/pac", "/wpad.dat")
+            or raw_target.endswith("/proxy.pac")
+            or raw_target.endswith("/pac")
+        ):
+            from . import rules_manager
+            pac_text = rules_manager.generate_pac_script(
+                port=config.LISTEN_PORT,
+                blocked_suffixes=config.BLOCKED_SUFFIXES,
+                rewrites=config.SNI_REWRITE,
+                passthrough_suffixes=config.PASSTHROUGH_SUFFIXES
+            )
+            pac_bytes = pac_text.encode("utf-8")
+            resp = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/x-ns-proxy-autoconfig; charset=utf-8\r\n"
+                b"Content-Length: " + str(len(pac_bytes)).encode("ascii") + b"\r\n"
+                b"Cache-Control: no-cache, no-store, must-revalidate\r\n"
+                b"Access-Control-Allow-Origin: *\r\n"
+                b"Connection: close\r\n\r\n" + pac_bytes
+            )
+            client_sock.sendall(resp)
+            client_sock.close()
+            return
+
         if first_line.startswith("CONNECT"):
-            parts = first_line.split()
             if len(parts) >= 2:
                 host_port = parts[1]
                 if ":" in host_port:
@@ -313,7 +354,9 @@ def handle_client(client_sock, addr):
                 else:
                     host, port = host_port, 443
 
-                if is_blocked_domain(host):
+                if is_passthrough_domain(host):
+                    handle_passthrough(client_sock, host, port)
+                elif is_blocked_domain(host):
                     handle_https_mitm(client_sock, host, port)
                 else:
                     handle_passthrough(client_sock, host, port)
@@ -354,6 +397,10 @@ def _remove_pid():
 
 
 def main():
+    from . import rules_manager
+    rules_manager.load_rules()
+    rules_manager.export_pac_file()
+
     ensure_identity()
     load_strategy_cache()
 

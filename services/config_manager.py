@@ -34,6 +34,11 @@ def env_info():
     import sys
     py = f"{sys.version_info.major}.{sys.version_info.minor}." \
          f"{sys.version_info.micro}"
+    try:
+        import cryptography
+        crypto_ver = getattr(cryptography, "__version__", "")
+    except ImportError:
+        crypto_ver = ""
     ossl = config.OPENSSL
     found = os.path.exists(ossl)
     if not found:
@@ -49,8 +54,9 @@ def env_info():
         "version": config.VERSION,
         "python": py,
         "python_exe": sys.executable,
+        "cryptography_version": crypto_ver or "内置可用",
         "openssl_path": ossl,
-        "openssl_version": ossl_ver or "未知",
+        "openssl_version": ossl_ver or "纯代码模式（无需 OpenSSL）",
         "openssl_found": found,
         "listen": f"{config.LISTEN_HOST}:{config.LISTEN_PORT}",
         "strict_upstream": config.STRICT_UPSTREAM,

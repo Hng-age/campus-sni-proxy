@@ -13,12 +13,14 @@ _LEVEL_RE = re.compile(r"\[(ERROR|WARNING|INFO|DEBUG)\]")
 MAX_LINES = 10000
 
 LEVEL_NAMES = ["全部", "INFO 及以上", "WARNING 及以上", "仅 ERROR", "含 DEBUG"]
+# None 表示没有 [LEVEL] 标记的普通输出（例如 proxy_manager.ps1 的操作回显），
+# 必须在前两档筛选中可见，否则“操作输出”面板会一直是空白。
 LEVEL_FILTERS = [
-    {"INFO", "WARNING", "ERROR", "DEBUG"},
-    {"INFO", "WARNING", "ERROR"},
+    {"INFO", "WARNING", "ERROR", "DEBUG", None},
+    {"INFO", "WARNING", "ERROR", None},
     {"WARNING", "ERROR"},
     {"ERROR"},
-    {"INFO", "WARNING", "ERROR", "DEBUG"},
+    {"INFO", "WARNING", "ERROR", "DEBUG", None},
 ]
 
 

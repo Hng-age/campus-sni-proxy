@@ -8,15 +8,14 @@ import ssl
 import threading
 import time
 
+from . import config
 from .config import (
-    ALLOWED_SNI_POOL,
     ASSET_COMPAT,
     ASSET_COMPAT_SUFFIXES,
     ATTEMPT_TIMEOUT,
     CDN_FAMILIES,
     CDN_SIBLING_HOSTS,
     NEG_CACHE_TTL,
-    SNI_REWRITE,
     STRATEGY_FILE,
     STRICT_UPSTREAM,
 )
@@ -243,7 +242,7 @@ def build_candidates(domain):
         _remember_ips(resolve_system(sibling) + resolve_domain(sibling),
                       _family_of(sibling))
 
-    first_sni = SNI_REWRITE.get(domain) or bare
+    first_sni = config.SNI_REWRITE.get(domain) or bare
 
     # 0. own IP + real host SNI: works when the firewall allows the real SNI,
     #    and avoids wrong-edge 404s (e.g. live.douyin.com)
@@ -266,12 +265,12 @@ def build_candidates(domain):
     #    bare-domain edge with a whitelisted SNI; try this early
     if bare != domain and bare_ips:
         for ip in bare_ips[:3]:
-            for sni in ALLOWED_SNI_POOL:
+            for sni in config.ALLOWED_SNI_POOL:
                 cands.append((ip, sni, "bare+pool"))
 
     # 4. own IP + allowed SNI pool (CDN edges accepting foreign SNI)
     for ip in own_ips[:3]:
-        for sni in ALLOWED_SNI_POOL:
+        for sni in config.ALLOWED_SNI_POOL:
             cands.append((ip, sni, "own+pool"))
 
     # de-duplicate identical (ip, sni) attempts
@@ -403,7 +402,7 @@ def connect_upstream(domain, port):
     bare = bare_domain(domain)
     family = _family_of(domain)
     host_snis = {domain.lower(), bare.lower()}
-    mapped = SNI_REWRITE.get(domain)
+    mapped = config.SNI_REWRITE.get(domain)
     if mapped:
         host_snis.add(mapped.lower())
     verified_cands = [c for c in cands if c[1].lower() in host_snis]

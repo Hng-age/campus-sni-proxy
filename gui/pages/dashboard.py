@@ -282,9 +282,15 @@ class DashboardPage(Page):
         sys_info_col.setSpacing(6)
 
         env = env_info()
-        os_ver = f"{platform.system()} {platform.release()}"
-        if "11" in platform.version() or int(platform.version().split(".")[0]) >= 10:
-            os_ver = "Windows 11 专业版" if platform.win32_edition() != "None" else "Windows 11"
+        try:
+            import sys as _sys
+            _win = _sys.getwindowsversion()
+            os_ver = "Windows 11" if _win.build >= 22000 else "Windows 10"
+            _edition = platform.win32_edition()
+            if _edition and _edition != "None":
+                os_ver += f" · {_edition}"
+        except Exception:
+            os_ver = f"{platform.system()} {platform.release()}"
 
         self.lab_os = QLabel(f"🪟 操作系统： {os_ver}")
         self.lab_os.setObjectName("SysInfoLabel")
@@ -508,15 +514,16 @@ class DashboardPage(Page):
         self.ctx.confirm_and_run("stop", "停止服务", text, "停止")
 
     def _goto_diag(self):
-        self.ctx._nav(2)
+        # 侧边栏顺序：仪表盘0 运行管理1 规则管理2 网络诊断3 网络测速4 日志中心5 ...
+        self.ctx._nav(3)
         # Automatically trigger diagnostics
-        diag_page = self.ctx.stack.widget(2)
+        diag_page = self.ctx.stack.widget(3)
         if hasattr(diag_page, "_run"):
             diag_page._run()
 
     def _goto_logs(self):
-        # 侧边栏顺序：仪表盘0 运行管理1 网络诊断2 网络测速3 日志中心4
-        self.ctx._nav(4)
+        # 侧边栏顺序：仪表盘0 运行管理1 规则管理2 网络诊断3 网络测速4 日志中心5 ...
+        self.ctx._nav(5)
 
     def _manual_refresh(self):
         self.ctx.refresh_now()

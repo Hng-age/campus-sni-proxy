@@ -5,9 +5,9 @@ import unittest
 class VersionTests(unittest.TestCase):
     """Version and layout checks; deliberately does not import PySide6."""
 
-    def test_version_is_200(self):
+    def test_version_is_210(self):
         from sni_proxy import config
-        self.assertEqual(config.VERSION, "2.0.0")
+        self.assertEqual(config.VERSION, "2.1.0")
 
     def test_services_util_base_dir_is_project_root(self):
         from services import util
