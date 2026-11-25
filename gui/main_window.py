@@ -28,6 +28,7 @@ from gui.pages.rules import RulesPage
 from gui.pages.service import ServicePage
 from gui.pages.settings import SettingsPage
 from gui.pages.speedtest import SpeedTestPage
+from gui.pages.tun import TunPage
 from gui.settings_store import SettingsStore
 from gui.sidebar import Sidebar
 from gui.workers import FuncWorker
@@ -40,7 +41,7 @@ POLL_MS = 3000
 
 
 class BackgroundWidget(QWidget):
-    """Painted gradient background with soft blue/purple glow blobs."""
+    """Clean minimalist flat background canvas with crisp 1px outer frame."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -67,41 +68,11 @@ class BackgroundWidget(QWidget):
         pm.fill(QColor(self._pal["bg_top"]))
         p = QPainter(pm)
         p.setRenderHint(QPainter.Antialiasing)
-        grad = QLinearGradient(0, 0, 0, max(1, self.height()))
-        grad.setColorAt(0.0, QColor(self._pal["bg_top"]))
-        grad.setColorAt(1.0, QColor(self._pal["bg_bottom"]))
-        p.fillRect(pm.rect(), QBrush(grad))
         w, h = float(self.width()), float(self.height())
-        for cx, cy, r, (cr, cg, cb, ca) in (
-                (int(w * 0.90), int(h * 0.10), 420, self._pal.get("glow1", (37, 99, 235, 70))),
-                (int(w * 0.08), int(h * 0.92), 360, self._pal.get("glow2", (139, 92, 246, 60))),
-                (int(w * 0.50), int(h * 0.04), 320, (6, 182, 212, 45))):
-            rg = QRadialGradient(cx, cy, r)
-            rg.setColorAt(0.0, QColor(cr, cg, cb, ca))
-            rg.setColorAt(1.0, QColor(cr, cg, cb, 0))
-            p.setBrush(QBrush(rg))
-            p.setPen(Qt.NoPen)
-            p.drawEllipse(cx - r, cy - r, 2 * r, 2 * r)
-
-        # Subtle glowing ribbon curves in background
         is_light = self._pal.get("id") == "light"
-        p.setPen(QPen(QColor(37, 99, 235, 25) if is_light else QColor(56, 189, 248, 25), 1.5))
-        p.setBrush(Qt.NoBrush)
-        path1 = QPainterPath()
-        path1.moveTo(0, h * 0.35)
-        path1.cubicTo(w * 0.35, h * 0.05, w * 0.70, h * 0.50, w, h * 0.20)
-        p.drawPath(path1)
-
-        p.setPen(QPen(QColor(139, 92, 246, 20), 1.2))
-        path2 = QPainterPath()
-        path2.moveTo(0, h * 0.55)
-        path2.cubicTo(w * 0.40, h * 0.25, w * 0.65, h * 0.75, w, h * 0.40)
-        p.drawPath(path2)
-
-        border_col = QColor(203, 213, 225, 220) if is_light else QColor(56, 189, 248, 60)
+        border_col = QColor("#CBD5E1") if is_light else QColor("#232D3F")
         p.setPen(QPen(border_col, 1.0))
-        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1.0, h - 1.0), 14, 14)
-
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1.0, h - 1.0), 10, 10)
         p.end()
         self._cache = pm
 
@@ -118,9 +89,16 @@ class MainWindow(QMainWindow):
         self.settings = SettingsStore(self)
         self.last_snapshot = {}
         self._busy = False
+        self._action_stalled = False
         self._snap_worker = None
         self._action_worker = None
         self._workers = []
+
+        # 操作超时兜底：后台动作卡死时也要解锁界面，避免按钮永久置灰
+        self._action_watchdog = QTimer(self)
+        self._action_watchdog.setSingleShot(True)
+        self._action_watchdog.setInterval(180000)
+        self._action_watchdog.timeout.connect(self._on_action_stall)
 
         # ------- central layout over painted background
         self.bg = BackgroundWidget()
@@ -130,6 +108,7 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
 
         self.title_bar = TitleBar(VERSION, self.bg)
+        self.title_bar.tray_requested.connect(self._hide_to_tray)
         self.title_bar.minimize_requested.connect(self.showMinimized)
         self.title_bar.maximize_requested.connect(self._toggle_maximize)
         self.title_bar.close_requested.connect(self.close)
@@ -157,10 +136,11 @@ class MainWindow(QMainWindow):
         self.diag_page = DiagnosticsPage(self)
         self.speed_page = SpeedTestPage(self)
         self.logs_page = LogsPage(self)
+        self.tun_page = TunPage(self)
         self.cert_page = CertificatesPage(self)
         self.settings_page = SettingsPage(self)
         for p in (self.dash_page, self.service_page, self.rules_page, self.diag_page,
-                  self.speed_page, self.logs_page, self.cert_page, self.settings_page):
+                  self.speed_page, self.logs_page, self.tun_page, self.cert_page, self.settings_page):
             self.stack.addWidget(p)
             p.request_action.connect(self._run_action)
 
@@ -209,6 +189,29 @@ class MainWindow(QMainWindow):
             self.showNormal()
         else:
             self.showMaximized()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._ensure_win32_taskbar_toggle()
+
+    def _ensure_win32_taskbar_toggle(self):
+        """Allow Windows taskbar icon click to minimize and restore the frameless window."""
+        import os
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            GWL_STYLE = -16
+            WS_MINIMIZEBOX = 0x00020000
+            WS_MAXIMIZEBOX = 0x00010000
+            WS_SYSMENU = 0x00080000
+            cur = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+            want = cur | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU
+            if cur != want:
+                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, want)
+        except Exception:
+            pass
 
     # frameless edge resize (empty margins propagate mouse events here)
     _EDGE = 6
@@ -328,6 +331,7 @@ class MainWindow(QMainWindow):
             "・网络诊断：一键检查网络接口、DNS、端口、系统代理与证书状态。\n"
             "・网络测速：对比直连与本地代理通道的带宽、延迟和抖动。\n"
             "・日志中心：实时查看运行日志并导出。\n"
+            "・TUN / VPN：填写共享代理 IP/端口/账号密码，创建虚拟网卡接管整机 App，支持规则/全局切换。\n"
             "・证书管理：查看设备 CA、安装或移除根证书。\n"
             "・设置中心：主题、玻璃效果、字体、托盘行为与诊断脱敏。\n\n"
             "如遇异常，可用 SNI代理_一键启动.bat / start.bat 命令行入口恢复环境。")
@@ -342,6 +346,8 @@ class MainWindow(QMainWindow):
         self.dash_page.set_palette(pal)
         if hasattr(self, "rules_page") and hasattr(self.rules_page, "set_palette"):
             self.rules_page.set_palette(pal)
+        if hasattr(self, "tun_page") and hasattr(self.tun_page, "set_palette"):
+            self.tun_page.set_palette(pal)
         if hasattr(self, "speed_page") and hasattr(self.speed_page, "set_palette"):
             self.speed_page.set_palette(pal)
         if hasattr(self.service_page, "log") and hasattr(self.service_page.log, "set_palette"):
@@ -366,31 +372,84 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------- tray icon
     def _build_tray(self):
+        self._tray_tip_shown = False
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
         menu = QMenu()
-        act_show = menu.addAction("显示主窗口")
-        act_show.triggered.connect(self._tray_show)
-        act_refresh = menu.addAction("立即刷新状态")
+        self._act_toggle = menu.addAction("显示 / 隐藏主窗口")
+        self._act_toggle.triggered.connect(self._tray_toggle)
+        menu.addSeparator()
+
+        act_start_sni = menu.addAction("▶ 启动 SNI 代理")
+        act_start_sni.triggered.connect(lambda: self._run_action("start"))
+        act_stop_sni = menu.addAction("■ 停止 SNI 代理")
+        act_stop_sni.triggered.connect(lambda: self._run_action("stop"))
+        menu.addSeparator()
+
+        act_start_tun = menu.addAction("🛰 启动 TUN / VPN")
+        act_start_tun.triggered.connect(lambda: self._run_action("start-tun"))
+        act_stop_tun = menu.addAction("■ 停止 TUN / VPN")
+        act_stop_tun.triggered.connect(lambda: self._run_action("stop-tun"))
+        menu.addSeparator()
+
+        act_settings = menu.addAction("⚙ 打开设置中心")
+        act_settings.triggered.connect(self._tray_open_settings)
+        act_refresh = menu.addAction("🔄 立即刷新状态")
         act_refresh.triggered.connect(self.refresh_now)
         menu.addSeparator()
-        act_quit = menu.addAction("退出")
+
+        act_quit = menu.addAction("完全退出")
         act_quit.triggered.connect(self._quit_app)
         self.tray_menu = menu
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._tray_activated)
         self.tray.setToolTip(f"{APP_NAME} v{VERSION}")
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.show()
 
     def _tray_show(self):
         self.showNormal()
+        self.raise_()
         self.activateWindow()
+
+    def _tray_toggle(self):
+        """单击托盘/任务栏图标：显示窗口；再次单击最小化。"""
+        if self.isVisible() and not self.isMinimized():
+            self.showMinimized()
+        else:
+            self._tray_show()
+
+    def reveal_window(self):
+        """从托盘、最小化或后台状态唤回唯一窗口（供第二实例唤起调用）。"""
+        self._tray_show()
+
+    def _tray_open_settings(self):
+        self._tray_show()
+        idx = self.stack.indexOf(self.settings_page)
+        if idx >= 0:
+            self.sidebar.select(idx)
+            self._nav(idx)
+
+    def _hide_to_tray(self):
+        self.hide()
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.show()
+            if not getattr(self, "_tray_tip_shown", False):
+                self._tray_tip_shown = True
+                self.tray.showMessage(
+                    f"{APP_NAME} 已在后台运行",
+                    "窗口已隐藏至系统托盘，单击托盘图标可随时恢复。"
+                )
 
     def _tray_activated(self, reason):
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
-            self._tray_show()
+            self._tray_toggle()
 
     def _quit_app(self):
         self._really_quit = True
         self.close()
+        app = QApplication.instance()
+        if app:
+            app.quit()
 
     # --------------------------------------------------- status polling
     def _track_worker(self, worker, attr):
@@ -467,6 +526,8 @@ class MainWindow(QMainWindow):
         if self._busy:
             return
         self._busy = True
+        self._action_stalled = False
+        self._action_watchdog.start()
         for i in range(self.stack.count()):
             page = self.stack.widget(i)
             try:
@@ -497,6 +558,10 @@ class MainWindow(QMainWindow):
             del self._action_tail[:-200]
 
     def _action_done(self, result, error):
+        worker = self.sender()
+        if worker is not None and worker is not self._action_worker:
+            return      # 已被超时兜底解锁的旧操作，忽略迟到的回调
+        self._action_watchdog.stop()
         self._busy = False
         ok = bool(result and result[0])
         if error:
@@ -508,6 +573,10 @@ class MainWindow(QMainWindow):
             except AttributeError:
                 pass
         if not ok:
+            if getattr(self, "_action_stalled", False):
+                self._action_stalled = False
+                self.refresh_now()
+                return
             detail = "操作失败或被取消，详见“运行管理”页的操作输出。"
             tail = [ln for ln in getattr(self, "_action_tail", []) if ln.strip()]
             if error:
@@ -516,22 +585,47 @@ class MainWindow(QMainWindow):
                 detail += "\n\n最近输出：\n" + "\n".join(tail[-8:])
             detail += "\n（若弹出的 UAC 提权窗口被取消，也会视为未完成）"
             QMessageBox.warning(self, "操作未完成", detail)
+        self._action_stalled = False
+        self.refresh_now()
+
+    def _on_action_stall(self):
+        """后台动作超过 3 分钟没有结果：先解锁界面，避免按钮永久不可用。"""
+        if not self._busy:
+            return
+        self._busy = False
+        self._action_stalled = True
+        for i in range(self.stack.count()):
+            page = self.stack.widget(i)
+            try:
+                page.on_action_finished(False)
+            except AttributeError:
+                pass
+        QMessageBox.information(
+            self, "操作超时",
+            "后台操作超过 3 分钟仍未返回，已先解除界面锁定。\n"
+            "请稍后在页面上查看实际状态；若仍未生效，可重新点击对应按钮重试。")
         self.refresh_now()
 
     # ------------------------------------------------------- close/quit
     def closeEvent(self, event):
-        to_tray = bool(self.settings.get("minimize_to_tray", False))
-        if to_tray and not getattr(self, "_really_quit", False):
+        to_tray = bool(self.settings.get("minimize_to_tray", True))
+        if (to_tray and not getattr(self, "_really_quit", False)
+                and QSystemTrayIcon.isSystemTrayAvailable()):
             event.ignore()
-            self.hide()
-            self.tray.show()
-            self.tray.showMessage(
-                f"{APP_NAME} 仍在运行",
-                "已最小化到系统托盘，点击图标可恢复窗口。")
+            self._hide_to_tray()
             return
         self.poll_timer.stop()
+        if hasattr(self, "tun_page") and hasattr(self.tun_page, "poll_timer"):
+            self.tun_page.poll_timer.stop()
+        try:
+            self.tray.hide()
+        except Exception:
+            pass
         # let in-flight workers settle so QThreads are not destroyed running
-        for w in list(self._workers):
+        all_workers = list(self._workers)
+        if hasattr(self, "tun_page"):
+            all_workers.extend(getattr(self.tun_page, "_workers", []))
+        for w in all_workers:
             try:
                 if w.isRunning():
                     w.wait(1500)

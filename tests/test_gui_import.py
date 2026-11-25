@@ -33,7 +33,8 @@ class GuiImportTests(unittest.TestCase):
         for name in ("gui.pages.dashboard", "gui.pages.service",
                      "gui.pages.rules", "gui.pages.diagnostics",
                      "gui.pages.speedtest", "gui.pages.logs",
-                     "gui.pages.certificates", "gui.pages.settings"):
+                     "gui.pages.tun", "gui.pages.certificates",
+                     "gui.pages.settings"):
             with self.subTest(module=name):
                 self._import(name)
 
@@ -44,11 +45,12 @@ class GuiImportTests(unittest.TestCase):
         from gui.main_window import MainWindow
         app = QApplication.instance() or QApplication([])
         win = MainWindow()
-        self.assertEqual(win.stack.count(), 8)
+        self.assertEqual(win.stack.count(), 9)
         for i in range(win.stack.count()):
             win.sidebar.select(i)
             win._nav(i)
             self.assertIsNotNone(win.stack.widget(i))
+        win._really_quit = True
         win.close()
 
     def test_probe_worker_delivers_result(self):
@@ -93,6 +95,7 @@ class GuiImportTests(unittest.TestCase):
             self.assertTrue(page.btn_start_probe.isEnabled())
         finally:
             probe_service.probe_domain_smart = original
+            win._really_quit = True
             win.close()
 
     def test_build_qss_contains_glass_panel(self):
@@ -128,6 +131,25 @@ class GuiImportTests(unittest.TestCase):
         win.settings.set("theme", "system")
         self.assertEqual(win.settings_page.combo_theme.currentIndex(), 0)
 
+        # Tray hide & settings autostart widget existence
+        self.assertTrue(hasattr(win.settings_page, "check_autostart"))
+        self.assertTrue(hasattr(win.settings_page, "btn_hide_tray"))
+        win._hide_to_tray()
+        self.assertFalse(win.isVisible())
+        win._tray_show()
+
+        # TunPage saved profiles table & ProfileEditorDialog smoke check
+        from gui.pages.tun import ProfileEditorDialog
+        dlg = ProfileEditorDialog(profile={
+            "id": "p1", "name": "测试线路", "protocol": "socks5",
+            "server": "127.0.0.1", "port": 18081, "username": "u", "password": "p",
+        }, parent=win)
+        d = dlg.profile_data()
+        self.assertEqual(d["name"], "测试线路")
+        self.assertEqual(d["server"], "127.0.0.1")
+        dlg.close()
+
+        win._really_quit = True
         win.close()
 
 

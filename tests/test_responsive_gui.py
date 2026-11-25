@@ -46,6 +46,7 @@ class ResponsiveGuiTests(unittest.TestCase):
                         f"Page {name} content is wider than the viewport "
                         f"({h_bar.maximum()} px clipped)"
                     )
+        win._really_quit = True
         win.close()
 
 

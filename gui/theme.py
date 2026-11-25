@@ -1,64 +1,69 @@
-"""Glassmorphism dark & light themes: palette + Qt stylesheet builder."""
+"""Clean minimalist light & dark themes: palette + Qt stylesheet builder."""
+
+import os
+import tempfile
 
 FONT_FAMILY = '"Microsoft YaHei UI", "Segoe UI", "PingFang SC", sans-serif'
 FONT_SCALES = [9, 10, 11]   # pt; index 0/1/2 = 标准 / 大 / 更大
 
 DARK = {
     "id": "dark",
-    "bg_top": "#0A0F1D",
-    "bg_bottom": "#0D1527",
-    "glow1": (37, 99, 235, 75),        # 蓝
-    "glow2": (139, 92, 246, 65),       # 紫
-    "sidebar": "rgba(13, 21, 39, 215)",
-    "card_rgb": (17, 24, 42),
-    "card_border": "rgba(56, 189, 248, 48)",
-    "panel_solid": "rgba(17, 24, 42, 245)",
-    "accent": "#2563EB",
-    "accent2": "#3B82F6",
+    "bg_top": "#0F141E",
+    "bg_bottom": "#0F141E",
+    "sidebar": "#151C28",
+    "sidebar_border": "#232D3F",
+    "card_rgb": (24, 32, 46),
+    "card_border": "rgba(148, 163, 184, 38)",
+    "panel_solid": "#18202E",
+    "accent": "#3B82F6",
+    "accent2": "#2563EB",
     "ok": "#10B981",
     "warn": "#F59E0B",
     "err": "#EF4444",
-    "text": "#F8FAFC",
+    "text": "#F1F5F9",
     "muted": "#94A3B8",
-    "input_bg": "rgba(15, 23, 42, 210)",
-    "view_bg": "rgba(15, 23, 42, 220)",
+    "input_bg": "#111824",
+    "view_bg": "#111824",
     "view_text": "#E2E8F0",
+    "table_alt": "rgba(255, 255, 255, 8)",
+    "table_header": "#1A2333",
     "tooltip_bg": "#1E293B",
-    "combo_popup": "#0F172A",
-    "hover": "rgba(37, 99, 235, 45)",
+    "combo_popup": "#18202E",
+    "hover": "rgba(59, 130, 246, 28)",
     "danger": "#DC2626",
-    "hero_bg1": "#0E1934",
-    "hero_bg2": "#0A1228",
-    "hero_border": "rgba(56, 189, 248, 0.35)",
+    "hero_bg1": "#18202E",
+    "hero_bg2": "#18202E",
+    "hero_border": "rgba(148, 163, 184, 42)",
 }
 
 LIGHT = {
     "id": "light",
-    "bg_top": "#F8FAFC",              # 清爽明亮底色
-    "bg_bottom": "#EDF2F7",
-    "glow1": (199, 210, 254, 60),     # 柔和淡蓝光晕
-    "glow2": (221, 214, 254, 50),     # 柔和淡紫光晕
-    "sidebar": "rgba(255, 255, 255, 235)",
+    "bg_top": "#F5F7FA",
+    "bg_bottom": "#F5F7FA",
+    "sidebar": "#FFFFFF",
+    "sidebar_border": "#E2E8F0",
     "card_rgb": (255, 255, 255),
-    "card_border": "rgba(203, 213, 225, 180)",
-    "panel_solid": "rgba(255, 255, 255, 250)",
+    "card_border": "#E2E8F0",
+    "panel_solid": "#FFFFFF",
     "accent": "#2563EB",
-    "accent2": "#3B82F6",
-    "ok": "#10B981",
+    "accent2": "#1D4ED8",
+    "ok": "#059669",
     "warn": "#D97706",
-    "err": "#EF4444",
-    "text": "#0F172A",                # 深黑文字，杜绝白字看不清
+    "err": "#DC2626",
+    "text": "#0F172A",
     "muted": "#64748B",
     "input_bg": "#FFFFFF",
     "view_bg": "#F8FAFC",
     "view_text": "#1E293B",
-    "tooltip_bg": "#1E293B",
+    "table_alt": "#F8FAFC",
+    "table_header": "#F1F5F9",
+    "tooltip_bg": "#0F172A",
     "combo_popup": "#FFFFFF",
-    "hover": "rgba(37, 99, 235, 25)",
+    "hover": "rgba(37, 99, 235, 18)",
     "danger": "#DC2626",
-    "hero_bg1": "#EFF6FF",
-    "hero_bg2": "#DBEAFE",
-    "hero_border": "rgba(191, 219, 254, 200)",
+    "hero_bg1": "#FFFFFF",
+    "hero_bg2": "#FFFFFF",
+    "hero_border": "#E2E8F0",
 }
 
 
@@ -102,12 +107,33 @@ def card_alpha(settings):
     """Card background alpha (0-255) from the glass strength setting."""
     is_light = resolve_theme_id(settings) == "light"
     if not settings.get("glass", True):
-        return 250 if is_light else 245
+        return 255 if is_light else 248
     strength = int(settings.get("glass_strength", 60))
     strength = max(0, min(100, strength))
     if is_light:
-        return 185 + int(strength * 0.65)  # 185 .. 250
-    return 60 + int(strength * 1.15)   # 60 .. 175
+        return 225 + int(strength * 0.30)  # 225 .. 255
+    return 185 + int(strength * 0.65)      # 185 .. 250
+
+
+_CHECK_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" '
+    'viewBox="0 0 16 16"><path d="M3.4 8.5l3.1 3.2 6.2-7.1" fill="none" '
+    'stroke="#FFFFFF" stroke-width="2.2" stroke-linecap="round" '
+    'stroke-linejoin="round"/></svg>'
+)
+
+
+def _check_icon_qss():
+    """勾选框选中态的对勾图标：首次使用时写入临时目录并返回 QSS url()。"""
+    try:
+        path = os.path.join(tempfile.gettempdir(), "sni_proxy_qss", "check.svg")
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(_CHECK_SVG)
+        return f'url("{path.replace(os.sep, "/")}")'
+    except Exception:
+        return ""
 
 
 def build_qss(settings):
@@ -119,7 +145,10 @@ def build_qss(settings):
     font_pt = FONT_SCALES[max(0, min(len(FONT_SCALES) - 1,
                                      int(settings.get("font_scale", 0))))]
     small = font_pt - 1
-    title = font_pt + 1
+    title = font_pt + 2
+
+    check_icon = _check_icon_qss()
+    check_img = f"image: {check_icon};" if check_icon else ""
 
     return f"""
     * {{
@@ -131,13 +160,13 @@ def build_qss(settings):
     QLabel {{ color: {p['text']}; background: transparent; }}
     #MutedLabel {{ color: {p['muted']}; }}
     #TinyLabel {{ color: {p['muted']}; font-size: {small}pt; }}
-    #TitleLabel {{ font-size: {title}pt; font-weight: 600; color: {p['text']}; }}
-    #BrandName {{ color: {p['text']}; font-size: {title}pt; font-weight: 600; }}
+    #TitleLabel {{ font-size: {title}pt; font-weight: 700; color: {p['text']}; }}
+    #BrandName {{ color: {p['text']}; font-size: {title}pt; font-weight: 700; }}
     #BrandVersion {{ color: {p['muted']}; font-size: {small - 1}pt; }}
     #TitleChip {{
         color: {p['muted']}; font-size: {small}pt;
         background: {card}; border: 1px solid {card_border};
-        border-radius: 9px; padding: 2px 10px;
+        border-radius: 8px; padding: 3px 10px;
     }}
     QFrame#HLine {{ background: {card_border}; border: none; max-height: 1px; }}
 
@@ -145,47 +174,47 @@ def build_qss(settings):
         color: {p['text']};
         background: {card};
         border: 1px solid {card_border};
-        border-radius: 10px;
-        padding: 6px 16px;
+        border-radius: 8px;
+        padding: 6px 14px;
         font-size: {font_pt}pt;
     }}
     QPushButton:hover {{ border-color: {p['accent']}; background: {p['hover']}; }}
     QPushButton:pressed {{ background: {p['accent']}; color: #FFFFFF; }}
+    QPushButton:checked {{
+        background: {p['accent']}; color: #FFFFFF;
+        border-color: {p['accent']}; font-weight: 600;
+    }}
     QPushButton:disabled {{
-        color: {p['muted']}; background: rgba({r}, {g}, {b}, 90);
-        border-color: rgba(167, 181, 203, 20);
+        color: {p['muted']}; background: rgba({r}, {g}, {b}, 95);
+        border-color: rgba(148, 163, 184, 24);
     }}
     QPushButton#Primary {{
         color: #FFFFFF; font-weight: 600; border: none;
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-            stop:0 {p['accent']}, stop:1 {p['accent2']});
+        background: {p['accent']};
     }}
-    QPushButton#Primary:hover {{
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-            stop:0 {p['accent2']}, stop:1 {p['accent']});
-    }}
+    QPushButton#Primary:hover {{ background: {p['accent2']}; }}
     QPushButton#Primary:disabled {{
-        background: rgba({r}, {g}, {b}, 100); color: rgba(255,255,255,120);
+        background: rgba({r}, {g}, {b}, 110); color: rgba(255,255,255,130);
     }}
     QPushButton#Danger {{
         color: #FFFFFF; font-weight: 600; border: none;
         background: {p['danger']};
     }}
-    QPushButton#Danger:hover {{ background: #c53838; }}
+    QPushButton#Danger:hover {{ background: #B91C1C; }}
     QPushButton#Danger:disabled {{
-        background: rgba(239, 100, 100, 90); color: rgba(255,255,255,120);
+        background: rgba(220, 38, 38, 95); color: rgba(255,255,255,130);
     }}
     QPushButton#WinBtn, QPushButton#WinBtnClose {{
         color: {p['muted']}; background: transparent; border: none;
-        border-radius: 8px; min-width: 36px; min-height: 26px;
-        font-size: {small}pt; padding: 0;
+        border-radius: 6px; min-width: 32px; min-height: 26px;
+        font-size: {small}pt; padding: 0 6px;
     }}
     QPushButton#WinBtn:hover {{ background: {p['hover']}; color: {p['text']}; }}
     QPushButton#WinBtnClose:hover {{ background: {p['danger']}; color: #FFFFFF; }}
 
     QLineEdit, QComboBox, QSpinBox {{
         background: {p['input_bg']}; color: {p['text']};
-        border: 1px solid {card_border}; border-radius: 9px;
+        border: 1px solid {card_border}; border-radius: 8px;
         padding: 5px 10px; selection-background-color: {p['accent']};
     }}
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{ border-color: {p['accent']}; }}
@@ -197,65 +226,90 @@ def build_qss(settings):
     }}
     QSpinBox::up-button, QSpinBox::down-button {{ width: 16px; border: none; }}
 
+    QRadioButton {{ color: {p['text']}; spacing: 8px; background: transparent; }}
     QCheckBox {{ color: {p['text']}; spacing: 8px; background: transparent; }}
     QCheckBox::indicator {{
-        width: 16px; height: 16px; border-radius: 5px;
+        width: 16px; height: 16px; border-radius: 4px;
         border: 1px solid {card_border}; background: {p['input_bg']};
     }}
     QCheckBox::indicator:hover {{ border-color: {p['accent']}; }}
-    QCheckBox::indicator:checked {{ background: {p['accent']}; border-color: {p['accent']}; }}
+    QCheckBox::indicator:checked {{
+        background: {p['accent']}; border-color: {p['accent']};
+        {check_img}
+    }}
+    QCheckBox::indicator:checked:hover {{ background: {p['accent2']}; border-color: {p['accent2']}; }}
+    QCheckBox::indicator:disabled {{ border-color: rgba(148, 163, 184, 60); }}
 
     QPlainTextEdit, QTextEdit, QListWidget {{
         background: {p['view_bg']}; color: {p['view_text']};
-        border: 1px solid {card_border}; border-radius: 12px;
+        border: 1px solid {card_border}; border-radius: 10px;
         padding: 8px; font-family: Consolas, "Microsoft YaHei UI"; font-size: {small}pt;
     }}
+
+    QTableWidget {{
+        background: {p['view_bg']};
+        alternate-background-color: {p['table_alt']};
+        color: {p['view_text']};
+        border: 1px solid {card_border};
+        border-radius: 10px;
+        gridline-color: {card_border};
+        selection-background-color: {p['hover']};
+        selection-color: {p['text']};
+    }}
+    QHeaderView::section {{
+        background: {p['table_header']};
+        color: {p['muted']};
+        font-weight: 600;
+        border: none;
+        border-bottom: 1px solid {card_border};
+        padding: 6px 8px;
+    }}
+
     QScrollArea {{ background: transparent; border: none; }}
     QScrollArea > QWidget {{ background: transparent; }}
     QScrollArea > QWidget > QWidget {{ background: transparent; }}
-    QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
+    QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px; }}
     QScrollBar::handle:vertical {{
-        background: {card_border}; border-radius: 5px; min-height: 30px;
+        background: {card_border}; border-radius: 4px; min-height: 28px;
     }}
     QScrollBar::handle:vertical:hover {{ background: {p['accent']}; }}
     QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
-    QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
+    QScrollBar:horizontal {{ background: transparent; height: 8px; margin: 2px; }}
     QScrollBar::handle:horizontal {{
-        background: {card_border}; border-radius: 5px; min-width: 30px;
+        background: {card_border}; border-radius: 4px; min-width: 28px;
     }}
     QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 
     #Sidebar {{
         background: {p['sidebar']};
-        border: 1px solid {card_border};
-        border-radius: 16px;
+        border: 1px solid {p['sidebar_border']};
+        border-radius: 12px;
     }}
     #SidebarTip {{ color: {p['muted']}; font-size: {small - 1}pt; background: transparent; }}
     QPushButton#NavButton {{
         text-align: left; color: {p['muted']}; background: transparent;
-        border: none; border-radius: 10px; padding: 9px 13px;
+        border: none; border-radius: 8px; padding: 7px 12px;
         font-size: {font_pt}pt;
     }}
     QPushButton#NavButton:hover {{ color: {p['text']}; background: {p['hover']}; }}
     QPushButton#NavButton:checked {{
         color: #FFFFFF; font-weight: 600;
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-            stop:0 {p['accent']}, stop:1 {p['accent2']});
+        background: {p['accent']};
     }}
-    QPushButton#NavButton:disabled {{ color: rgba(167,181,203,90); background: transparent; }}
+    QPushButton#NavButton:disabled {{ color: rgba(148,163,184,90); background: transparent; }}
 
     #GlassPanel, #StatusCard, #MetricCard {{
         background-color: {card};
         border: 1px solid {card_border};
-        border-radius: 16px;
+        border-radius: 12px;
     }}
-    #StatusCard {{ border-radius: 14px; }}
+    #StatusCard {{ border-radius: 10px; }}
     #PanelTitle {{
         color: {p['muted']}; font-size: {small}pt; font-weight: 600;
         background: transparent; border: none; padding: 0;
     }}
     #PanelHeaderTitle {{
-        color: {p['text']}; font-size: 13pt; font-weight: 700;
+        color: {p['text']}; font-size: 11.5pt; font-weight: 700;
         background: transparent; border: none; padding: 0;
     }}
     #CardGlyph {{ font-size: {title}pt; background: transparent; border: none; }}
@@ -266,23 +320,21 @@ def build_qss(settings):
     #CardValue[state="error"] {{ color: {p['err']}; }}
     #CardSub {{ color: {p['muted']}; font-size: {small - 1}pt; background: transparent; border: none; padding: 0; }}
 
-    #MetricTitle {{ color: {p['muted']}; font-size: 9.5pt; background: transparent; }}
-    #MetricValue {{ color: {p['text']}; font-size: 13.5pt; font-weight: 700; background: transparent; }}
+    #MetricTitle {{ color: {p['muted']}; font-size: 9pt; background: transparent; }}
+    #MetricValue {{ color: {p['text']}; font-size: 13pt; font-weight: 700; background: transparent; }}
 
-    #TitleBarText {{ color: {p['muted']}; font-size: 10pt; background: transparent; font-weight: 500; }}
-    #TitleBarClock {{ color: {p['muted']}; font-size: 9.5pt; background: transparent; font-family: monospace; }}
-
-    #ItemText {{ color: {p['text']}; font-size: 10pt; background: transparent; }}
-    #SysInfoLabel {{ color: {p['text']}; font-size: 9.5pt; background: transparent; }}
-    #TimelineText {{ color: {p['text']}; font-size: 9.5pt; background: transparent; }}
-    #TimelineTime {{ color: {p['muted']}; font-size: 9pt; font-family: monospace; background: transparent; }}
+    #TitleBarText {{ color: {p['muted']}; font-size: 9.5pt; background: transparent; font-weight: 500; }}
+    #ItemText {{ color: {p['text']}; font-size: 9.5pt; background: transparent; }}
+    #SysInfoLabel {{ color: {p['text']}; font-size: 9pt; background: transparent; }}
+    #TimelineText {{ color: {p['text']}; font-size: 9pt; background: transparent; }}
+    #TimelineTime {{ color: {p['muted']}; font-size: 8.5pt; font-family: Consolas, monospace; background: transparent; }}
 
     #SecondaryBtn {{
         background: {card};
         border: 1px solid {card_border};
-        border-radius: 12px;
+        border-radius: 8px;
         color: {p['text']};
-        font-size: 11pt;
+        font-size: 10pt;
         font-weight: 600;
     }}
     #SecondaryBtn:hover {{
@@ -290,17 +342,15 @@ def build_qss(settings):
         border-color: {p['accent']};
         color: {p['accent']};
     }}
-    #SecondaryBtn:pressed {{
-        background: rgba({r}, {g}, {b}, 220);
-    }}
+    #SecondaryBtn:pressed {{ background: {card}; }}
 
     #SecondaryBtnSmall {{
         background: {card};
         border: 1px solid {card_border};
-        border-radius: 8px;
+        border-radius: 6px;
         color: {p['muted']};
-        font-size: 9pt;
-        padding: 4px 10px;
+        font-size: 8.5pt;
+        padding: 3px 10px;
     }}
     #SecondaryBtnSmall:hover {{
         background: {p['hover']};

@@ -278,7 +278,7 @@ def build_report(results, started, seconds):
         counts[r["level"]] += 1
     lines = [
         "=" * 58,
-        " SNI Proxy Desktop 环境诊断报告",
+        " toci 环境诊断报告",
         f" 时间：{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(started))}",
         f" 版本：v{config.VERSION}    耗时：{seconds}s",
         f" 汇总：正常 {counts['ok']} / 需要注意 {counts['warn']} / "

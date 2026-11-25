@@ -553,7 +553,7 @@ def connect_upstream(domain, port):
                 del entry["endpoints"][5:]
             entry["fail_ts"] = None
         save_strategy_cache()
-        log(f"  [OK] {domain} via {ip} SNI={sni} ({how}, {level})")
+        log(f"  [OK] {domain} via {ip}:{port} SNI={sni} ({how}, {level})")
         return ssock, sni
 
     # sibling rescue: try endpoints cached from other subdomains of the

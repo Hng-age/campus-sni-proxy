@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 
 LISTEN_HOST = "127.0.0.1"
 # 允许测试时用环境变量换端口，避免影响正在运行的 8888 实例

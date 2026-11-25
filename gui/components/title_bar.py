@@ -1,14 +1,13 @@
-"""Custom frameless title bar matching the 2.0.0 design with live ticking status."""
+"""Minimalist frameless title bar with live status chip and hide-to-tray button."""
 
-import time
-
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
 
 class TitleBar(QWidget):
-    """Brand + live ticking status (● 系统正常 | YYYY-MM-DD HH:MM:SS) + window buttons."""
+    """Slim title bar: app title, status indicator, hide-to-tray & window buttons."""
 
+    tray_requested = Signal()
     minimize_requested = Signal()
     maximize_requested = Signal()
     close_requested = Signal()
@@ -16,44 +15,39 @@ class TitleBar(QWidget):
     def __init__(self, version, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WA_StyledBackground, False)
-        self.setFixedHeight(48)
+        self.setFixedHeight(40)
         self._drag_pos = None
 
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(18, 0, 14, 0)
-        lay.setSpacing(12)
+        lay.setContentsMargins(16, 0, 10, 0)
+        lay.setSpacing(10)
 
-        # Left subtle title
-        self.title_lab = QLabel(
-            f"SNI Proxy Desktop - 校园网 SNI 代理管理与诊断工具 v{version}")
-        self.title_lab.setStyleSheet(
-            "color: #94A3B8; font-size: 10pt; background: transparent; font-weight: 500;")
+        self.title_lab = QLabel(f"toci  v{version}")
+        self.title_lab.setObjectName("TitleBarText")
         lay.addWidget(self.title_lab)
         lay.addStretch(1)
 
-        # Right live status indicator
+        # Clean status pill
         self.status_dot = QLabel("●")
         self.status_dot.setStyleSheet(
-            "color: #10B981; font-size: 11pt; background: transparent;")
+            "color: #94A3B8; font-size: 9pt; background: transparent;")
         lay.addWidget(self.status_dot)
 
-        self.status_text = QLabel("系统正常")
+        self.status_text = QLabel("服务已停止")
         self.status_text.setStyleSheet(
-            "color: #10B981; font-size: 9.5pt; font-weight: 600; background: transparent;")
+            "color: #94A3B8; font-size: 9pt; font-weight: 600; background: transparent;")
         lay.addWidget(self.status_text)
 
-        self.sep_lab = QLabel("|")
-        self.sep_lab.setStyleSheet("color: #475569; font-size: 9pt; background: transparent;")
-        lay.addWidget(self.sep_lab)
+        lay.addSpacing(8)
 
-        self.clock_lab = QLabel(time.strftime("%Y-%m-%d %H:%M:%S"))
-        self.clock_lab.setStyleSheet(
-            "color: #94A3B8; font-size: 9.5pt; background: transparent; font-family: monospace;")
-        lay.addWidget(self.clock_lab)
+        btn_tray = QPushButton("托盘")
+        btn_tray.setObjectName("SecondaryBtnSmall")
+        btn_tray.setCursor(Qt.PointingHandCursor)
+        btn_tray.setFixedHeight(24)
+        btn_tray.setToolTip("隐藏主窗口到系统托盘后台运行")
+        btn_tray.clicked.connect(self.tray_requested.emit)
+        lay.addWidget(btn_tray)
 
-        lay.addSpacing(14)
-
-        # Window controls
         btn_min = QPushButton("—")
         btn_min.setObjectName("WinBtn")
         btn_min.setToolTip("最小化")
@@ -66,41 +60,26 @@ class TitleBar(QWidget):
 
         btn_close = QPushButton("✕")
         btn_close.setObjectName("WinBtnClose")
-        btn_close.setToolTip("关闭")
+        btn_close.setToolTip("关闭（若开启托盘驻留则隐藏到托盘）")
         btn_close.clicked.connect(self.close_requested.emit)
 
         for b in (btn_min, btn_max, btn_close):
             b.setCursor(Qt.PointingHandCursor)
-            b.setFixedSize(36, 28)
+            b.setFixedSize(32, 26)
             lay.addWidget(b)
 
-        # 1-second clock timer
-        self._timer = QTimer(self)
-        self._timer.setInterval(1000)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start()
-
     def set_palette(self, pal):
-        is_light = pal.get("id") == "light"
-        text_col = "#475569" if is_light else "#94A3B8"
-        sep_col = "#CBD5E1" if is_light else "#475569"
+        text_col = pal.get("muted", "#64748B")
         self.title_lab.setStyleSheet(
-            f"color: {text_col}; font-size: 10pt; background: transparent; font-weight: 500;")
-        self.clock_lab.setStyleSheet(
-            f"color: {text_col}; font-size: 9.5pt; background: transparent; font-family: monospace;")
-        self.sep_lab.setStyleSheet(
-            f"color: {sep_col}; font-size: 9pt; background: transparent;")
-
-    def _tick(self):
-        self.clock_lab.setText(time.strftime("%Y-%m-%d %H:%M:%S"))
+            f"color: {text_col}; font-size: 9.5pt; background: transparent; font-weight: 500;")
 
     def set_chip(self, text, color):
         """Update system status text & dot color."""
         self.status_text.setText(text)
         self.status_text.setStyleSheet(
-            f"color: {color}; font-size: 9.5pt; font-weight: 600; background: transparent;")
+            f"color: {color}; font-size: 9pt; font-weight: 600; background: transparent;")
         self.status_dot.setStyleSheet(
-            f"color: {color}; font-size: 11pt; background: transparent;")
+            f"color: {color}; font-size: 9pt; background: transparent;")
 
     # ------------------------------------------------------ window drag
     def mousePressEvent(self, e):

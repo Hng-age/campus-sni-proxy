@@ -8,7 +8,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Version = "2.1.0"
+$Version = "3.0.0"
+
+# 隐藏控制台中的提权脚本偶发“动作已执行完但 PowerShell 进程不退出”，
+# 会让 GUI 的操作线程一直等待、按钮永久置灰。用硬退出规避该问题。
+function Exit-Immediate([int]$code) {
+    try { [Environment]::Exit($code) } catch { exit $code }
+}
 
 # 非交互模式：让重定向的输出按 UTF-8 编码（GUI 按 UTF-8 读取）
 if ($Action -ne "") {
@@ -27,6 +33,13 @@ $StateDir = Join-Path $ScriptDir "state"
 $ProxyStateFile = Join-Path $StateDir "proxy_state.json"
 $ActiveFlag = Join-Path $StateDir "proxy_active.flag"
 $LogFile = Join-Path $ScriptDir "logs\proxy.log"
+$TunPidFile = Join-Path $StateDir "tun.pid"
+$TunActiveFlag = Join-Path $StateDir "tun_active.flag"
+$TunYamlFile = Join-Path $StateDir "tun_mihomo.yaml"
+$TunStateDir = Join-Path $StateDir "tun"
+$TunConfigFile = Join-Path $ScriptDir "tun_config.json"
+$TunLogFile = Join-Path $ScriptDir "logs\tun.log"
+$TunErrFile = Join-Path $ScriptDir "logs\tun_err.log"
 
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -35,11 +48,11 @@ function Test-IsAdmin {
 }
 
 # ---------------- 管理员权限细分判断 ----------------
-# 只有显式安装/卸载系统机器级根证书时才必须提权；日常启停代理进程与修改当前用户系统代理免提权
+# 只有显式安装/卸载系统机器级根证书，或创建/销毁 TUN 虚拟网卡时才必须提权；日常 SNI 代理启停免提权
 $adminRequired = $false
 if ($Action -ne "") {
     $actLower = $Action.ToLower()
-    if ($actLower -in @("install-ca", "remove-ca", "install-ca-machine", "remove-ca-machine")) {
+    if ($actLower -in @("install-ca", "remove-ca", "install-ca-machine", "remove-ca-machine", "start-tun", "stop-tun", "restart-tun")) {
         $adminRequired = $true
     }
 }
@@ -59,17 +72,25 @@ if ($adminRequired -and (-not (Test-IsAdmin))) {
             "`"$pwshExe`" $innerArgs > `"$actOut`" 2> `"$actErr`"",
             "exit /b %ERRORLEVEL%"
         )
+        $exitCode = 1
         try {
             Set-Content -Path $actCmd -Value $cmdLines -Encoding OEM
             $p = Start-Process -FilePath $actCmd -Verb RunAs `
-                -WindowStyle Hidden -Wait -PassThru
-            foreach ($f in @($actOut, $actErr)) {
-                if (Test-Path $f) {
-                    $text = Get-Content $f -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                    if ($text) { Write-Host $text.TrimEnd() }
+                -WindowStyle Hidden -PassThru
+            # 不用 -Wait：超时后可强制结束，避免父进程永远等待提权子进程
+            if (-not $p.WaitForExit(240000)) {
+                try { $p.Kill() } catch { }
+                Write-Host "  [!!] 提权子进程超时未返回，已终止"
+                $exitCode = 124
+            } else {
+                foreach ($f in @($actOut, $actErr)) {
+                    if (Test-Path $f) {
+                        $text = Get-Content $f -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                        if ($text) { Write-Host $text.TrimEnd() }
+                    }
                 }
+                $exitCode = [int]$p.ExitCode
             }
-            exit $p.ExitCode
         } catch {
             $native = 0
             try { $native = [int]$_.Exception.NativeErrorCode } catch { }
@@ -78,10 +99,11 @@ if ($adminRequired -and (-not (Test-IsAdmin))) {
             } else {
                 Write-Host "  [!!] 提权失败：$($_.Exception.Message)"
             }
-            exit 1
+            $exitCode = 1
         } finally {
             Remove-Item $actCmd, $actOut, $actErr -Force -ErrorAction SilentlyContinue
         }
+        Exit-Immediate $exitCode
     }
     Write-Host ""
     Write-Host "  [!] 此操作需要管理员权限（安装/移除系统根证书）" -ForegroundColor Yellow
@@ -470,8 +492,8 @@ function Save-OriginalProxyState {
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
     if (Test-Path $ProxyStateFile) { return }
     $s = Get-ProxyRegState
-    # 1.0.2 没有备份：若当前已指向本工具，则按“无代理”记录
-    if ($s.ProxyEnable -eq 1 -and $s.ProxyServer -like "*127.0.0.1:8888*") {
+    # 1.0.2 没有备份：若当前已指向本工具（8888 或 TUN 17897），则按“无代理”记录
+    if ($s.ProxyEnable -eq 1 -and ($s.ProxyServer -like "*127.0.0.1:8888*" -or $s.ProxyServer -like "*127.0.0.1:17897*")) {
         $s.ProxyEnable = 0
         $s.ProxyServer = ""
     }
@@ -1212,11 +1234,198 @@ function Test-Speed {
     Write-Host ""
 }
 
+# ---------------- TUN / VPN 管理 ----------------
+function Find-Mihomo {
+    $cands = New-Object System.Collections.Generic.List[string]
+    $cands.Add((Join-Path $ScriptDir "bin\mihomo.exe"))
+    $cands.Add((Join-Path $ScriptDir "bin\verge-mihomo.exe"))
+    $cands.Add((Join-Path $ScriptDir "mihomo.exe"))
+    $cands.Add("D:\Clash Verge\verge-mihomo.exe")
+    $cands.Add("C:\Program Files\Clash Verge\verge-mihomo.exe")
+    $cands.Add("C:\Program Files (x86)\Clash Verge\verge-mihomo.exe")
+    foreach ($p in $cands) {
+        if ($p -and (Test-Path $p)) { return $p }
+    }
+    foreach ($cmdName in @("mihomo.exe", "verge-mihomo.exe")) {
+        $cmd = Get-Command $cmdName -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) { return $cmd.Source }
+    }
+    return $null
+}
+
+function Test-TunRunning {
+    if (Test-Path $TunPidFile) {
+        $rawPid = (Get-Content $TunPidFile -Raw -ErrorAction SilentlyContinue)
+        if ($rawPid -and $rawPid.Trim() -match "^\d+$") {
+            $proc = Get-Process -Id ([int]$rawPid.Trim()) -ErrorAction SilentlyContinue
+            if ($proc -and -not $proc.HasExited) { return $true }
+        }
+    }
+    $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { ($_.Name -like "*mihomo*") -and $_.CommandLine -like "*tun_mihomo.yaml*" }
+    return ($null -ne $procs)
+}
+
+function Stop-Tun {
+    Write-Host "  [*] 正在停止 TUN/VPN 服务..." -ForegroundColor Yellow
+
+    if (Test-Path $TunActiveFlag) {
+        Remove-Item $TunActiveFlag -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $ActiveFlag)) {
+            Restore-OriginalProxyState
+            Refresh-WinINet
+            Write-Host "  [OK] 系统代理已恢复为启动前设置" -ForegroundColor Green
+        }
+    }
+
+    if (Test-Path $TunPidFile) {
+        $rawPid = (Get-Content $TunPidFile -Raw -ErrorAction SilentlyContinue)
+        if ($rawPid -and $rawPid.Trim() -match "^\d+$") {
+            $pidInt = [int]$rawPid.Trim()
+            $proc = Get-Process -Id $pidInt -ErrorAction SilentlyContinue
+            if ($proc) {
+                Stop-Process -Id $pidInt -Force -ErrorAction SilentlyContinue
+                Write-Host "  [OK] 已结束 TUN 内核进程 PID $pidInt" -ForegroundColor Green
+            }
+        }
+        Remove-Item $TunPidFile -Force -ErrorAction SilentlyContinue
+    }
+
+    $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { ($_.Name -like "*mihomo*") -and $_.CommandLine -like "*tun_mihomo.yaml*" }
+    if ($procs) {
+        foreach ($p in $procs) {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+            Write-Host "  [OK] 已结束 TUN 残留进程 PID $($p.ProcessId)" -ForegroundColor Green
+        }
+    }
+
+    Start-Sleep -Milliseconds 600
+    if (-not (Test-TunRunning)) {
+        Write-Host "  [OK] TUN 虚拟网卡已安全关闭" -ForegroundColor Green
+        return $true
+    }
+    Write-Host "  [!!] TUN 进程未能完全退出" -ForegroundColor Red
+    return $false
+}
+
+function Start-Tun {
+    $mihomo = Find-Mihomo
+    if (-not $mihomo) {
+        Write-Host "  [!!] 未找到 TUN 内核文件 (bin\mihomo.exe)" -ForegroundColor Red
+        return $false
+    }
+    if (-not (Test-Path $TunYamlFile)) {
+        Write-Host "  [!!] 未找到 TUN 配置文件：$TunYamlFile，请先在 GUI 中保存配置。" -ForegroundColor Red
+        return $false
+    }
+
+    New-Item -ItemType Directory -Force -Path $TunStateDir | Out-Null
+    New-Item -ItemType Directory -Force -Path (Split-Path $TunLogFile) | Out-Null
+
+    Write-Host "  [*] 正在校验 TUN 配置文件..." -ForegroundColor Yellow
+    $valOut = & $mihomo -d $TunStateDir -f $TunYamlFile -t 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  [!!] TUN 配置校验失败：" -ForegroundColor Red
+        $valOut | ForEach-Object { Write-Host "       $_" -ForegroundColor DarkGray }
+        return $false
+    }
+
+    if (Test-TunRunning) {
+        Write-Host "  [*] 检测到旧 TUN 实例正在运行，先清理..." -ForegroundColor Yellow
+        [void](Stop-Tun)
+    }
+
+    $apiPort = 19090
+    $mixedPort = 17897
+    $setSysProxy = $true
+    $serverIp = ""
+    $devName = "SNI-Proxy-TUN"
+    if (Test-Path $TunConfigFile) {
+        try {
+            $tc = Get-Content $TunConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($tc.api_port) { $apiPort = [int]$tc.api_port }
+            if ($tc.mixed_port) { $mixedPort = [int]$tc.mixed_port }
+            if ($null -ne $tc.also_set_sys_proxy) { $setSysProxy = [bool]$tc.also_set_sys_proxy }
+            if ($tc.server) { $serverIp = [string]$tc.server }
+            if ($tc.device_name) { $devName = [string]$tc.device_name }
+        } catch { }
+    }
+
+    Remove-Item $TunLogFile, $TunErrFile -Force -ErrorAction SilentlyContinue
+    Write-Host "  [*] 正在启动 TUN 内核 ($mihomo)..." -ForegroundColor Yellow
+    try {
+        $proc = Start-Process -FilePath $mihomo `
+            -ArgumentList @("-d", "`"$TunStateDir`"", "-f", "`"$TunYamlFile`"") `
+            -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $TunLogFile -RedirectStandardError $TunErrFile
+    } catch {
+        Write-Host "  [!!] 无法启动 TUN 内核：$($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+    Set-Content -Path $TunPidFile -Value ([string]$proc.Id) -Encoding ASCII
+
+    $ready = $false
+    for ($i = 0; $i -lt 25; $i++) {
+        Start-Sleep -Milliseconds 400
+        if ($proc.HasExited) { break }
+        try {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $ar = $tcp.BeginConnect("127.0.0.1", $apiPort, $null, $null)
+            if ($ar.AsyncWaitHandle.WaitOne(250, $false) -and $tcp.Connected) {
+                $tcp.Close()
+                $ready = $true
+                break
+            }
+            $tcp.Close()
+        } catch { }
+    }
+
+    if (-not $ready) {
+        Write-Host "  [!!] TUN 启动超时或异常退出，最近日志：" -ForegroundColor Red
+        foreach ($f in @($TunErrFile, $TunLogFile)) {
+            if ((Test-Path $f) -and (Get-Item $f).Length -gt 0) {
+                Get-Content $f -Tail 10 -Encoding UTF8 -ErrorAction SilentlyContinue |
+                    ForEach-Object { Write-Host "       $_" -ForegroundColor DarkGray }
+            }
+        }
+        [void](Stop-Tun)
+        return $false
+    }
+
+    if ($setSysProxy) {
+        Save-OriginalProxyState
+        if (Test-Path $ActiveFlag) {
+            Remove-Item $ActiveFlag -Force -ErrorAction SilentlyContinue
+            Stop-Watchdog
+        }
+        $reg = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        Remove-ItemProperty -Path $reg -Name AutoConfigURL -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $reg -Name ProxyServer -Value "127.0.0.1:$mixedPort"
+        Set-ItemProperty -Path $reg -Name ProxyEnable -Value 1
+        $bypass = "localhost;127.*;10.*;192.168.*;<local>"
+        if ($serverIp) { $bypass = "$bypass;$serverIp" }
+        Set-ItemProperty -Path $reg -Name ProxyOverride -Value $bypass
+        Refresh-WinINet
+        Set-Content -Path $TunActiveFlag -Value (Get-Date).ToString("s") -Encoding ASCII
+        Write-Host "  [OK] 系统代理已同步指向 TUN 混合端口 127.0.0.1:$mixedPort" -ForegroundColor Green
+    }
+
+    Start-Sleep -Milliseconds 500
+    $nic = Get-NetAdapter -Name $devName -ErrorAction SilentlyContinue
+    if ($nic -and $nic.Status -eq "Up") {
+        Write-Host "  [OK] TUN 虚拟网卡 [$devName] 已就绪 (PID $($proc.Id))" -ForegroundColor Green
+    } else {
+        Write-Host "  [OK] TUN 内核已启动 (PID $($proc.Id))，正在等待虚拟网卡路由接管完成" -ForegroundColor Green
+    }
+    return $true
+}
+
 # ---------------- 启动前恢复 ----------------
-if ((Test-Path $ProxyStateFile) -and -not (Test-ProxyRunning)) {
+if ((Test-Path $ProxyStateFile) -and -not (Test-ProxyRunning) -and -not (Test-TunRunning)) {
     Write-Host ""
     Write-Host "  [恢复] 检测到上次代理异常退出，正在恢复系统代理..." -ForegroundColor Yellow
-    Remove-Item $ActiveFlag -Force -ErrorAction SilentlyContinue
+    Remove-Item $ActiveFlag, $TunActiveFlag -Force -ErrorAction SilentlyContinue
     Stop-Watchdog
     Restore-OriginalProxyState
     Write-Host "  [OK] 已恢复启动前的系统代理设置" -ForegroundColor Green
@@ -1226,12 +1435,22 @@ if ((Test-Path $ProxyStateFile) -and -not (Test-ProxyRunning)) {
 # ---------------- 非交互模式（GUI 调用，动作与菜单语义一致） ----------------
 if ($Action -ne "") {
     switch ($Action.ToLower()) {
+        "start-tun" {
+            if (-not (Start-Tun)) { Exit-Immediate 1 }
+        }
+        "stop-tun" {
+            if (-not (Stop-Tun)) { Exit-Immediate 1 }
+        }
+        "restart-tun" {
+            [void](Stop-Tun)
+            if (-not (Start-Tun)) { Exit-Immediate 1 }
+        }
         "start" {
-            if (-not (Initialize-Certs)) { Write-Host "  [!!] 设备证书初始化失败"; exit 1 }
+            if (-not (Initialize-Certs)) { Write-Host "  [!!] 设备证书初始化失败"; Exit-Immediate 1 }
             if (-not (Test-CaInstalled)) {
-                if (-not (Install-CA)) { Write-Host "  [!!] 根证书安装失败"; exit 1 }
+                if (-not (Install-CA)) { Write-Host "  [!!] 根证书安装失败"; Exit-Immediate 1 }
             }
-            if (-not (Start-Proxy)) { Write-Host "  [!!] 代理未启动，已跳过系统代理设置"; exit 1 }
+            if (-not (Start-Proxy)) { Write-Host "  [!!] 代理未启动，已跳过系统代理设置"; Exit-Immediate 1 }
             Set-SystemProxy
         }
         "stop" {
@@ -1241,11 +1460,11 @@ if ($Action -ne "") {
         "restart" {
             Unset-SystemProxy
             Stop-Proxy
-            if (-not (Initialize-Certs)) { Write-Host "  [!!] 设备证书初始化失败"; exit 1 }
+            if (-not (Initialize-Certs)) { Write-Host "  [!!] 设备证书初始化失败"; Exit-Immediate 1 }
             if (-not (Test-CaInstalled)) {
-                if (-not (Install-CA)) { Write-Host "  [!!] 根证书安装失败"; exit 1 }
+                if (-not (Install-CA)) { Write-Host "  [!!] 根证书安装失败"; Exit-Immediate 1 }
             }
-            if (-not (Start-Proxy)) { Write-Host "  [!!] 代理未启动"; exit 1 }
+            if (-not (Start-Proxy)) { Write-Host "  [!!] 代理未启动"; Exit-Immediate 1 }
             Set-SystemProxy
         }
         "set-proxy" {
@@ -1255,8 +1474,8 @@ if ($Action -ne "") {
             Unset-SystemProxy
         }
         "start-proxy" {
-            if (-not (Initialize-Certs)) { exit 1 }
-            if (-not (Start-Proxy)) { exit 1 }
+            if (-not (Initialize-Certs)) { Exit-Immediate 1 }
+            if (-not (Start-Proxy)) { Exit-Immediate 1 }
             Write-Host "  [提示] 请手动把浏览器代理设为 127.0.0.1:8888 或使用 PAC 脚本"
         }
         "stop-proxy" {
@@ -1275,12 +1494,12 @@ if ($Action -ne "") {
                 Write-Host "  [OK] 已从备份恢复系统代理设置"
             } else {
                 Write-Host "  [!!] 没有可用的系统代理备份，未做任何修改"
-                exit 1
+                Exit-Immediate 1
             }
         }
         "install-ca" {
-            if (-not (Initialize-Certs)) { exit 1 }
-            if (-not (Install-CA)) { exit 1 }
+            if (-not (Initialize-Certs)) { Exit-Immediate 1 }
+            if (-not (Install-CA)) { Exit-Immediate 1 }
         }
         "remove-ca" {
             Remove-CA
@@ -1289,10 +1508,10 @@ if ($Action -ne "") {
         "logs" { Show-Logs }
         default {
             Write-Host "  [!!] 未知 Action: $Action"
-            exit 2
+            Exit-Immediate 2
         }
     }
-    exit 0
+    Exit-Immediate 0
 }
 
 # ---------------- 主循环 ----------------

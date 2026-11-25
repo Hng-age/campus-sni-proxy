@@ -1,17 +1,17 @@
 @echo off
 rem =======================================================
-rem  SNI Proxy Desktop 2.1.0 - 桌面图形版启动器
+rem  toci 3.0.0 - 桌面图形版启动器
 rem =======================================================
 cd /d "%~dp0"
-title SNI Proxy Desktop
+title toci
 
-if exist "dist\SNI Proxy Desktop\SNI Proxy Desktop.exe" (
-    start "" "dist\SNI Proxy Desktop\SNI Proxy Desktop.exe"
+if exist "dist\toci\toci.exe" (
+    start "" "dist\toci\toci.exe"
     exit /b 0
 )
 
-if exist "SNI Proxy Desktop.exe" (
-    start "" "SNI Proxy Desktop.exe"
+if exist "toci.exe" (
+    start "" "toci.exe"
     exit /b 0
 )
 

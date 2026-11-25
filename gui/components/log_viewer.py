@@ -172,7 +172,7 @@ class LogViewer(QWidget):
     # ------------------------------------------------------------- export
     def export_view(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出日志", "sni-proxy-log.txt", "文本文件 (*.txt);;所有文件 (*)")
+            self, "导出日志", "toci-log.txt", "文本文件 (*.txt);;所有文件 (*)")
         if not path:
             return
         text = "\n".join(line for level, line in self._buffer

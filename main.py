@@ -1,4 +1,4 @@
-"""SNI Proxy Desktop - 校园网 SNI 代理 GUI 入口（v2.1.0）。
+"""toci - 校园网 SNI 代理 GUI 入口（v3.0.0）。
 
 用法：
     python main.py              启动桌面 GUI
@@ -9,6 +9,8 @@
 
 import os
 import sys
+
+SINGLE_INSTANCE_KEY = "toci-SingleInstance-v3"
 
 
 def _make_icon():
@@ -43,13 +45,13 @@ def main():
 
         if "--version" in sys.argv:
             try:
-                print(f"SNI Proxy Desktop v{VERSION}")
+                print(f"toci v{VERSION}")
             except Exception:
                 pass
             return 0
 
         from PySide6.QtCore import Qt
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
         from gui import theme
         from gui.main_window import MainWindow
@@ -59,7 +61,25 @@ def main():
         app = QApplication(sys.argv)
         app.setApplicationName(APP_NAME)
         app.setApplicationVersion(VERSION)
-        app.setOrganizationName("SNIProxy")
+        app.setOrganizationName("toci")
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            app.setQuitOnLastWindowClosed(False)
+
+        # ------- 单实例：重复启动时只唤回已运行窗口，不再新开窗口
+        from PySide6.QtNetwork import QLocalServer, QLocalSocket
+
+        probe = QLocalSocket()
+        probe.connectToServer(SINGLE_INSTANCE_KEY)
+        if probe.waitForConnected(400):
+            probe.write(b"reveal")
+            probe.flush()
+            probe.waitForBytesWritten(400)
+            probe.disconnectFromServer()
+            return 0
+
+        QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+        single_server = QLocalServer()
+        single_server.listen(SINGLE_INSTANCE_KEY)
 
         from PySide6.QtGui import QIcon
 
@@ -73,11 +93,27 @@ def main():
         theme.apply_theme(app, store.snapshot())
 
         win = MainWindow()
-        if not store.get("show_on_start", True):
-            win.hide()
+        start_minimized = (
+            "--minimized" in sys.argv
+            or "--tray" in sys.argv
+            or not store.get("show_on_start", True)
+        )
+        if QSystemTrayIcon.isSystemTrayAvailable():
             win.tray.show()
+        if start_minimized and QSystemTrayIcon.isSystemTrayAvailable():
+            win.hide()
         else:
             win.show()
+
+        def _on_second_instance():
+            while single_server.hasPendingConnections():
+                conn = single_server.nextPendingConnection()
+                if conn is not None:
+                    conn.disconnectFromServer()
+                    conn.deleteLater()
+            win.reveal_window()
+
+        single_server.newConnection.connect(_on_second_instance)
         return app.exec()
     except Exception as e:
         err_msg = traceback.format_exc()

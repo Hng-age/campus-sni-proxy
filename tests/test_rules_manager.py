@@ -63,6 +63,54 @@ class RulesManagerTests(unittest.TestCase):
         self.assertTrue(removed)
         self.assertNotIn("test.blocked.com", config.SNI_REWRITE)
 
+    def test_add_and_remove_upstream_port_override(self):
+        rules_manager.ensure_rules_file()
+        added = rules_manager.add_upstream_port_override(
+            "chat.example.com", "8443")
+        self.assertTrue(added)
+        self.assertEqual(
+            config.UPSTREAM_PORT_OVERRIDES.get("chat.example.com"), 8443)
+
+        # invalid ports are rejected
+        bad = rules_manager.add_upstream_port_override("bad.example.com", 0)
+        self.assertFalse(bad)
+        bad = rules_manager.add_upstream_port_override("bad.example.com", 70000)
+        self.assertFalse(bad)
+        self.assertNotIn("bad.example.com", config.UPSTREAM_PORT_OVERRIDES)
+
+        removed = rules_manager.remove_upstream_port_override("chat.example.com")
+        self.assertTrue(removed)
+        self.assertNotIn("chat.example.com", config.UPSTREAM_PORT_OVERRIDES)
+
+    def test_add_and_remove_upstream_cert_pin(self):
+        pin = "ab" * 32
+        rules_manager.ensure_rules_file()
+        added = rules_manager.add_upstream_cert_pin("chat.example.com", pin)
+        self.assertTrue(added)
+        self.assertEqual(
+            config.UPSTREAM_CERT_PINS.get("chat.example.com"), pin)
+
+        # 'sha256:' prefix and colons are normalized, not rejected
+        added2 = rules_manager.add_upstream_cert_pin(
+            "chat2.example.com", "sha256:" + ":".join(
+                pin[i:i + 4] for i in range(0, 64, 4)))
+        self.assertTrue(added2)
+        self.assertEqual(
+            config.UPSTREAM_CERT_PINS.get("chat2.example.com"), pin)
+
+        # invalid fingerprints are rejected
+        bad = rules_manager.add_upstream_cert_pin("bad.example.com", "zz" * 32)
+        self.assertFalse(bad)
+        bad = rules_manager.add_upstream_cert_pin("bad.example.com", "ab" * 31)
+        self.assertFalse(bad)
+        self.assertNotIn("bad.example.com", config.UPSTREAM_CERT_PINS)
+
+        removed = rules_manager.remove_upstream_cert_pin("chat.example.com")
+        self.assertTrue(removed)
+        self.assertNotIn("chat.example.com", config.UPSTREAM_CERT_PINS)
+        self.assertTrue(
+            rules_manager.remove_upstream_cert_pin("chat2.example.com"))
+
     def test_set_proxy_mode(self):
         rules_manager.ensure_rules_file()
         rules_manager.set_proxy_mode("global")

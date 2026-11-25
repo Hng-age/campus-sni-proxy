@@ -193,15 +193,9 @@ class RulesPage(Page):
         # -------------------------------------------------------------
         # 3. 分区切换 Tab 栏 (智能探测 / 封锁后缀 / SNI 映射 / 策略缓存)
         # -------------------------------------------------------------
-        tab_nav_frame = QFrame()
-        tab_nav_frame.setStyleSheet("""
-            QFrame {
-                background: rgba(15, 23, 42, 0.4);
-                border: 1px solid rgba(56, 189, 248, 0.15);
-                border-radius: 10px;
-            }
-        """)
-        tab_nav_layout = QHBoxLayout(tab_nav_frame)
+        self.tab_nav_frame = QFrame()
+        self.tab_nav_frame.setObjectName("StatusCard")
+        tab_nav_layout = QHBoxLayout(self.tab_nav_frame)
         tab_nav_layout.setContentsMargins(6, 6, 6, 6)
         tab_nav_layout.setSpacing(6)
 
@@ -219,7 +213,7 @@ class RulesPage(Page):
             tab_nav_layout.addWidget(btn, 1)
             btn.clicked.connect(lambda _=False, i=idx: self._switch_tab(i))
 
-        body_v.addWidget(tab_nav_frame)
+        body_v.addWidget(self.tab_nav_frame)
 
         # -------------------------------------------------------------
         # 4. 各分区卡片容器
@@ -251,7 +245,9 @@ class RulesPage(Page):
 
         desc = QLabel(
             "输入在校园网下打不开或加载异常的域名（例如 douyin.com、v.qq.com、example.edu.cn）。\n"
-            "系统将自动检测直连连通性，并在候选白名单 SNI 池与边缘 IP 中并发探测，找到最优绕过策略后支持一键写入分流规则。"
+            "v2 智能探测：先实测直连，再并发探测备用 TLS 端口（8443/2053/2083/2087/2096）与全部边缘 IP，"
+            "每条候选路径都以真实 HTTP 请求验证（拒绝 418 假通），并按证书类型自动选择端口改写、"
+            "证书指纹锁定或 SNI 伪装方案，一键写入分流规则。"
         )
         desc.setObjectName("MutedLabel")
         desc.setWordWrap(True)
@@ -281,20 +277,13 @@ class RulesPage(Page):
 
         # 探测结果卡片
         self.probe_result_card = QFrame()
-        self.probe_result_card.setStyleSheet("""
-            QFrame {
-                background: rgba(15, 23, 42, 0.65);
-                border: 1px solid rgba(56, 189, 248, 0.25);
-                border-radius: 12px;
-                padding: 10px;
-            }
-        """)
+        self.probe_result_card.setObjectName("StatusCard")
         rc_lay = QVBoxLayout(self.probe_result_card)
         rc_lay.setContentsMargins(14, 12, 14, 12)
         rc_lay.setSpacing(8)
 
         self.lbl_res_title = QLabel("探测结果待定")
-        self.lbl_res_title.setStyleSheet("font-size: 11pt; font-weight: 700; color: #FFFFFF;")
+        self.lbl_res_title.setObjectName("TitleLabel")
         rc_lay.addWidget(self.lbl_res_title)
 
         self.lbl_res_details = QLabel("暂无探测结果。在上方输入域名并点击“开始智能探测”。")
@@ -716,25 +705,56 @@ class RulesPage(Page):
             err = res.get("error", "未知错误") if res else "探测超时或无响应"
             self.lbl_res_title.setText("❌ 探测未通")
             self.lbl_res_title.setStyleSheet("font-size: 11pt; font-weight: 700; color: #EF4444;")
-            self.lbl_res_details.setText(f"原因：{err}\n建议检查网络连接或尝试手动添加放行白名单 SNI。")
+            self.lbl_res_details.setText(f"原因：{err}\n建议稍后重试（CDN 轮换可能换出可用 IP），或在「SNI 伪装」页手动添加映射。")
             self.btn_apply_probe.setEnabled(False)
             return
 
-        self.lbl_res_title.setText("✅ 智能探测成功，已发现最优解封策略！")
-        self.lbl_res_title.setStyleSheet("font-size: 11pt; font-weight: 700; color: #10B981;")
+        strategy = res.get("strategy", "sni_rewrite")
         domain = res["domain"]
         best_ip = res["best_ip"]
         best_sni = res["best_sni"]
-        lat = res["latency_ms"]
-        level = res.get("verify_level", "chain")
-        suf = res.get("recommended_suffix", domain)
+        lat = res.get("latency_ms", 0)
+        http_status = res.get("http_status", "")
+        server_hdr = res.get("server_header", "")
+        srv = f"  |  Server: {server_hdr}" if server_hdr else ""
 
-        detail_text = (
-            f"目标域名：{domain}  |  推荐规则后缀：*.{suf}\n"
-            f"优选边缘 IP：{best_ip}  |  伪装 SNI：{best_sni}\n"
-            f"握手耗时：{lat} ms  |  证书校验级别：{level} ({'直签' if level == 'host' else '证书链兼容'})\n"
-            f"直连状态：{'已被校园网 SNI 阻断' if res.get('is_blocked') else '直连正常'}"
-        )
+        if strategy == "direct":
+            self.lbl_res_title.setText("✅ 直连正常，无需添加分流规则")
+            self.lbl_res_title.setStyleSheet("font-size: 11pt; font-weight: 700; color: #10B981;")
+            self.lbl_res_details.setText(
+                f"目标域名：{domain}\n"
+                f"测试边缘 IP：{best_ip}  |  HTTP {http_status}{srv}\n"
+                f"实测延迟：{lat} ms\n"
+                "直连即可正常访问；若浏览器仍打不开，请检查浏览器/系统代理设置。"
+            )
+            self.btn_apply_probe.setEnabled(False)
+            return
+
+        self.lbl_res_title.setText("✅ 智能探测成功，已发现实测可用的绕过策略！")
+        self.lbl_res_title.setStyleSheet("font-size: 11pt; font-weight: 700; color: #10B981;")
+
+        if strategy in ("port_override", "port_override_pin"):
+            port = res.get("port", 443)
+            level = res.get("verify_level", "host")
+            cert_desc = ("CA 证书链有效，覆盖目标域名" if res.get("covers_host")
+                         else "自签证书，将按 SHA-256 指纹锁定")
+            detail_text = (
+                f"目标域名：{domain}  |  规则后缀：{domain}（精确主机）\n"
+                f"优选路径：{best_ip}:{port}  |  上游 SNI：{best_sni}（真实 SNI）\n"
+                f"HTTP 实测：HTTP {http_status}{srv}\n"
+                f"探测耗时：{lat} ms  |  证书校验：{cert_desc}"
+            )
+        else:  # sni_rewrite（SNI 伪装）
+            level = res.get("verify_level", "chain")
+            suf = res.get("recommended_suffix", domain)
+            detail_text = (
+                f"目标域名：{domain}  |  推荐规则后缀：*.{suf}\n"
+                f"优选边缘 IP：{best_ip}  |  伪装 SNI：{best_sni}\n"
+                f"HTTP 实测：HTTP {http_status}{srv}\n"
+                f"探测耗时：{lat} ms  |  证书校验级别：{level} ({'直签' if level == 'host' else '证书链兼容'})\n"
+                f"直连状态：{'已被校园网阻断' if res.get('is_blocked') else '直连正常'}\n"
+                "注意：SNI 伪装依赖目标边缘接受伪装 SNI，稳定性弱于端口改写方案。"
+            )
         self.lbl_res_details.setText(detail_text)
         self.btn_apply_probe.setEnabled(True)
 
@@ -742,31 +762,37 @@ class RulesPage(Page):
         if not self._current_probe_result or not self._current_probe_result.get("success"):
             return
         ok, msg = probe_service.apply_probe_result(self._current_probe_result)
-        if ok:
-            QMessageBox.information(self, "应用成功", msg)
-            self.btn_apply_probe.setEnabled(False)
-            self._refresh_all_data()
-        else:
+        if not ok:
             QMessageBox.warning(self, "应用失败", msg)
+            return
+
+        self.btn_apply_probe.setEnabled(False)
+        self._refresh_all_data()
+        QMessageBox.information(self, "应用成功", msg)
+
+        # 新规则写入后，运行中的代理进程需要重启才会加载（探测在 GUI 进程内写文件）
+        strategy = self._current_probe_result.get("strategy")
+        if strategy and strategy != "direct":
+            try:
+                from services import process_manager
+                running = process_manager.proxy_identity().get("running")
+            except Exception:
+                running = False
+            if running:
+                answer = QMessageBox.question(
+                    self, "重启代理",
+                    "新规则已写入。运行中的代理需要重启后才能生效，现在重启代理吗？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+                )
+                if answer == QMessageBox.Yes:
+                    self.request_action.emit("restart")
 
     # -------------------------------------------------------------
     # 主题适配
     # -------------------------------------------------------------
     def set_palette(self, pal):
         self._pal = pal
-        is_light = pal.get("id") == "light"
         for btn in (self.btn_tab_probe, self.btn_tab_rules,
                     self.btn_tab_rewrites, self.btn_tab_cache):
             btn.set_palette(pal)
-
-        bg_card = "rgba(255, 255, 255, 0.9)" if is_light else "rgba(15, 23, 42, 0.65)"
-        border_card = "rgba(203, 213, 225, 0.9)" if is_light else "rgba(56, 189, 248, 0.25)"
-        self.probe_result_card.setStyleSheet(f"""
-            QFrame {{
-                background: {bg_card};
-                border: 1px solid {border_card};
-                border-radius: 12px;
-                padding: 10px;
-            }}
-        """)
         self.update()
