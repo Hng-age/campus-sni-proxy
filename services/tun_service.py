@@ -102,6 +102,9 @@ DEFAULT_TUN_CONFIG = {
     "dns_servers": ["223.5.5.5", "119.29.29.29"],
     "bypass_lan": True,
     "also_set_sys_proxy": True,
+    "fallback_to_direct": True,
+    "fallback_interval": 10,
+    "fallback_url": "http://connect.rom.miui.com/generate_204",
     "mixed_port": 17897,
     "api_port": 19090,
     "device_name": TUN_DEVICE_NAME,
@@ -282,6 +285,17 @@ def _normalize_config(raw):
     cfg["fake_ip"] = bool(cfg.get("fake_ip", True))
     cfg["bypass_lan"] = bool(cfg.get("bypass_lan", True))
     cfg["also_set_sys_proxy"] = bool(cfg.get("also_set_sys_proxy", True))
+    cfg["fallback_to_direct"] = bool(cfg.get("fallback_to_direct", True))
+
+    try:
+        cfg["fallback_interval"] = max(5, min(300, int(cfg.get("fallback_interval", 10))))
+    except (TypeError, ValueError):
+        cfg["fallback_interval"] = 10
+
+    fb_url = str(cfg.get("fallback_url") or "").strip()
+    if not fb_url.startswith(("http://", "https://")):
+        fb_url = "http://connect.rom.miui.com/generate_204"
+    cfg["fallback_url"] = fb_url
 
     try:
         cfg["mixed_port"] = max(1024, min(65535, int(cfg.get("mixed_port", 17897))))
@@ -528,21 +542,48 @@ def generate_mihomo_yaml(cfg):
     if proto == "socks5":
         lines.append(f"    udp: {'true' if c['udp'] else 'false'}")
 
-    lines.extend([
-        "",
-        "proxy-groups:",
-        '  - name: "PROXY"',
-        "    type: select",
-        "    proxies:",
-        '      - "LAN-PROXY"',
-        '  - name: "GLOBAL"',
-        "    type: select",
-        "    proxies:",
-        '      - "LAN-PROXY"',
-        '      - "DIRECT"',
-        "",
-        "rules:",
-    ])
+    fallback_enabled = bool(c.get("fallback_to_direct", True))
+    fallback_interval = int(c.get("fallback_interval", 10))
+    fallback_url = str(c.get("fallback_url") or "http://connect.rom.miui.com/generate_204")
+
+    if fallback_enabled:
+        lines.extend([
+            "",
+            "proxy-groups:",
+            '  - name: "PROXY"',
+            "    type: fallback",
+            "    proxies:",
+            '      - "LAN-PROXY"',
+            '      - "DIRECT"',
+            f"    url: {_yaml_str(fallback_url)}",
+            f"    interval: {fallback_interval}",
+            "    timeout: 3000",
+            "    lazy: false",
+            '  - name: "GLOBAL"',
+            "    type: select",
+            "    proxies:",
+            '      - "PROXY"',
+            '      - "LAN-PROXY"',
+            '      - "DIRECT"',
+            "",
+            "rules:",
+        ])
+    else:
+        lines.extend([
+            "",
+            "proxy-groups:",
+            '  - name: "PROXY"',
+            "    type: select",
+            "    proxies:",
+            '      - "LAN-PROXY"',
+            '  - name: "GLOBAL"',
+            "    type: select",
+            "    proxies:",
+            '      - "LAN-PROXY"',
+            '      - "DIRECT"',
+            "",
+            "rules:",
+        ])
 
     rule_lines = []
     if server_is_ip:
@@ -775,6 +816,10 @@ def get_tun_status():
         "mode": cfg["mode"],
         "tun_enabled": False,
         "device_name": cfg.get("device_name", TUN_DEVICE_NAME),
+        "fallback_to_direct": bool(cfg.get("fallback_to_direct", True)),
+        "active_outbound": "",
+        "proxy_alive": None,
+        "fallback_active": False,
         "connections_count": 0,
         "upload_total": 0,
         "download_total": 0,
@@ -804,6 +849,20 @@ def get_tun_status():
             out["connections"] = items[:120]
         except Exception:
             pass
+        try:
+            pdata = _api_request(api_port, "/proxies/PROXY", timeout=0.4)
+            now = str(pdata.get("now") or "")
+            out["active_outbound"] = now
+            if out["fallback_to_direct"] and now == "DIRECT":
+                out["fallback_active"] = True
+        except Exception:
+            pass
+        try:
+            ldata = _api_request(api_port, "/proxies/LAN-PROXY", timeout=0.4)
+            if "alive" in ldata:
+                out["proxy_alive"] = bool(ldata["alive"])
+        except Exception:
+            pass
 
     return out
 
@@ -822,8 +881,9 @@ def switch_live_mode(mode):
         _api_request(api_port, "/configs", method="PATCH", payload={"mode": mode}, timeout=1.0)
         if mode == "global":
             try:
+                target = "PROXY" if cfg.get("fallback_to_direct", True) else "LAN-PROXY"
                 _api_request(api_port, "/proxies/GLOBAL", method="PUT",
-                             payload={"name": "LAN-PROXY"}, timeout=1.0)
+                             payload={"name": target}, timeout=1.0)
             except Exception:
                 pass
         return True, f"已实时切换为{'全局代理' if mode == 'global' else '规则代理'}模式"

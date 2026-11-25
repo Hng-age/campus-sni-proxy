@@ -67,7 +67,7 @@ class ProfileEditorDialog(QDialog):
 
         grid.addWidget(QLabel("服务器 IP / 域名"), 2, 0)
         self.inp_server = QLineEdit()
-        self.inp_server.setPlaceholderText("例如：192.168.112.32")
+        self.inp_server.setPlaceholderText("例如：192.168.1.10")
         grid.addWidget(self.inp_server, 2, 1)
 
         grid.addWidget(QLabel("端口"), 3, 0)
@@ -78,7 +78,7 @@ class ProfileEditorDialog(QDialog):
 
         grid.addWidget(QLabel("用户名（可选）"), 4, 0)
         self.inp_user = QLineEdit()
-        self.inp_user.setPlaceholderText("无认证可留空（如 b404）")
+        self.inp_user.setPlaceholderText("无认证可留空（如 user）")
         grid.addWidget(self.inp_user, 4, 1)
 
         grid.addWidget(QLabel("密码（可选）"), 5, 0)
@@ -492,12 +492,15 @@ class TunPage(Page):
         self.chk_fake_ip.setToolTip("使用 198.18.0.1/16 虚拟 DNS，确保微信、抖音、游戏等自建网络栈 App 全接管")
         self.chk_sys_proxy = QCheckBox("同步接管系统代理 (17897)")
         self.chk_sys_proxy.setToolTip("启动 TUN 时同步把 Windows 系统代理指向 127.0.0.1:17897，浏览器与 App 统一走分流规则")
+        self.chk_fallback_direct = QCheckBox("代理掉线自动恢复直连（推荐）")
+        self.chk_fallback_direct.setToolTip("当上级共享代理断开或不可达时，自动切回本机直连（规则与全局模式均生效），恢复后自动切回代理")
 
-        for c in (self.chk_bypass_lan, self.chk_fake_ip, self.chk_sys_proxy):
+        for c in (self.chk_bypass_lan, self.chk_fake_ip, self.chk_sys_proxy, self.chk_fallback_direct):
             c.setMinimumWidth(0)
         opts.addWidget(self.chk_bypass_lan, 0, 0)
         opts.addWidget(self.chk_fake_ip, 0, 1)
         opts.addWidget(self.chk_sys_proxy, 1, 0)
+        opts.addWidget(self.chk_fallback_direct, 1, 1)
         nv.addLayout(opts)
 
         panel_net.add_layout(nv)
@@ -536,6 +539,12 @@ class TunPage(Page):
         self.cmb_final.addItem("DIRECT（其余流量全部直连）", "DIRECT")
         final_row.addWidget(self.cmb_final, 1)
         v.addLayout(final_row)
+
+        self.lbl_fallback_rule = QLabel("")
+        self.lbl_fallback_rule.setObjectName("MutedLabel")
+        self.lbl_fallback_rule.setWordWrap(True)
+        self.lbl_fallback_rule.setMinimumWidth(0)
+        v.addWidget(self.lbl_fallback_rule)
 
         add_box = QFrame()
         add_box.setObjectName("StatusCard")
@@ -704,6 +713,9 @@ class TunPage(Page):
         self.chk_bypass_lan.setChecked(bool(cfg.get("bypass_lan", True)))
         self.chk_fake_ip.setChecked(bool(cfg.get("fake_ip", True)))
         self.chk_sys_proxy.setChecked(bool(cfg.get("also_set_sys_proxy", True)))
+        fb_on = bool(cfg.get("fallback_to_direct", True))
+        self.chk_fallback_direct.setChecked(fb_on)
+        self._update_fallback_banner(fb_on, int(cfg.get("fallback_interval", 10)))
 
         idx_f = self.cmb_final.findData(cfg.get("final_policy", "PROXY"))
         if idx_f >= 0:
@@ -717,12 +729,25 @@ class TunPage(Page):
         self._render_profiles_table()
         self._render_rules_table()
 
+    def _update_fallback_banner(self, enabled, interval=10):
+        if enabled:
+            self.lbl_fallback_rule.setText(
+                f"保底规则：✅ 已开启「代理掉线自动恢复直连」（每 {interval} 秒检测一次，代理断开自动切为 DIRECT 直连）"
+            )
+            self.lbl_fallback_rule.setStyleSheet("color: #10B981;")
+        else:
+            self.lbl_fallback_rule.setText(
+                "保底规则：⚪ 未开启「代理掉线自动恢复直连」（可在「线路与配置」选项卡勾选开启）"
+            )
+            self.lbl_fallback_rule.setStyleSheet("")
+
     def _collect_ui_config(self):
         cfg = copy.deepcopy(self._cfg)
         cfg["stack"] = self.cmb_stack.currentData() or "gvisor"
         cfg["bypass_lan"] = self.chk_bypass_lan.isChecked()
         cfg["fake_ip"] = self.chk_fake_ip.isChecked()
         cfg["also_set_sys_proxy"] = self.chk_sys_proxy.isChecked()
+        cfg["fallback_to_direct"] = self.chk_fallback_direct.isChecked()
         cfg["final_policy"] = self.cmb_final.currentData() or "PROXY"
         cfg["mode"] = "global" if self.btn_mode_global.isChecked() else "rule"
         cfg["rules"] = copy.deepcopy(self._rules)
@@ -1016,6 +1041,10 @@ class TunPage(Page):
     def _save_and_reload(self):
         cfg = self._collect_ui_config()
         self._cfg = tun_service.save_tun_config(cfg)
+        self._update_fallback_banner(
+            bool(self._cfg.get("fallback_to_direct", True)),
+            int(self._cfg.get("fallback_interval", 10)),
+        )
         if not self._cfg.get("server"):
             QMessageBox.information(self, "已保存", "网络与分流设置已保存（请先添加并选用代理线路后再启动 TUN）。")
             return
@@ -1141,9 +1170,18 @@ class TunPage(Page):
 
         running = bool(st.get("running"))
         dev = st.get("device_name", tun_service.TUN_DEVICE_NAME)
+        fallback_active = bool(st.get("fallback_active"))
+        active_out = st.get("active_outbound", "")
         if running:
-            self.lbl_run_state.setText(f"🟢 TUN 运行中（{dev}）")
-            self.lbl_run_state.setStyleSheet("font-size: 11pt; font-weight: 700; color: #10B981;")
+            if fallback_active:
+                self.lbl_run_state.setText(f"🟡 代理已掉线，已自动恢复直连（{dev}）")
+                self.lbl_run_state.setStyleSheet("font-size: 11pt; font-weight: 700; color: #F59E0B;")
+            elif active_out == "LAN-PROXY":
+                self.lbl_run_state.setText(f"🟢 TUN 运行中 · 代理正常（{dev}）")
+                self.lbl_run_state.setStyleSheet("font-size: 11pt; font-weight: 700; color: #10B981;")
+            else:
+                self.lbl_run_state.setText(f"🟢 TUN 运行中（{dev}）")
+                self.lbl_run_state.setStyleSheet("font-size: 11pt; font-weight: 700; color: #10B981;")
             self.btn_start_tun.setText("🔄 重启 TUN")
             self.btn_start_tun.setEnabled(not self._busy)
             self.btn_stop_tun.setEnabled(not self._busy)
@@ -1163,8 +1201,13 @@ class TunPage(Page):
         cnt = st.get("connections_count", 0)
         up = tun_service.fmt_bytes(st.get("upload_total", 0))
         dn = tun_service.fmt_bytes(st.get("download_total", 0))
+        fallback_note = ""
+        if running and fallback_active:
+            fallback_note = "  |  ⚠️ 上游掉线·已切回直连"
+        elif running and active_out:
+            fallback_note = f"  |  出口: {active_out}"
         self.lbl_live_stats.setText(
-            f"当前线路: {line_label}  |  活动连接: {cnt}  |  ↑ {up}  ↓ {dn}"
+            f"当前线路: {line_label}  |  活动连接: {cnt}  |  ↑ {up}  ↓ {dn}{fallback_note}"
         )
 
         if self.box_conns.isVisible():

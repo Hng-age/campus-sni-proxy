@@ -488,14 +488,24 @@ function Get-ProxyRegState {
     }
 }
 
+function Test-IsSelfProxyValue([string]$val) {
+    if (-not $val) { return $false }
+    return ($val -like "*127.0.0.1:8888*" -or $val -like "*127.0.0.1:17897*")
+}
+
 function Save-OriginalProxyState {
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
     if (Test-Path $ProxyStateFile) { return }
     $s = Get-ProxyRegState
-    # 1.0.2 没有备份：若当前已指向本工具（8888 或 TUN 17897），则按“无代理”记录
-    if ($s.ProxyEnable -eq 1 -and ($s.ProxyServer -like "*127.0.0.1:8888*" -or $s.ProxyServer -like "*127.0.0.1:17897*")) {
+    # 若当前系统代理或 PAC 已指向本工具（8888 或 TUN 17897），按“直连（无代理）”记录，避免恢复死循环
+    $isSelfServer = ($s.ProxyEnable -eq 1 -and (Test-IsSelfProxyValue $s.ProxyServer))
+    $isSelfPac = (Test-IsSelfProxyValue $s.AutoConfigURL)
+    if ($isSelfServer -or $isSelfPac) {
         $s.ProxyEnable = 0
         $s.ProxyServer = ""
+        $s.ProxyOverride = ""
+        $s.AutoConfigURL = ""
+        $s.WinHttpSettings = ""
     }
     $s | ConvertTo-Json | Set-Content -Path $ProxyStateFile -Encoding UTF8
 }
@@ -507,19 +517,27 @@ function Restore-OriginalProxyState {
     if (Test-Path $ProxyStateFile) {
         try {
             $s = Get-Content $ProxyStateFile -Raw -Encoding UTF8 | ConvertFrom-Json
-            Set-ItemProperty -Path $reg -Name ProxyEnable -Value ([int]$s.ProxyEnable)
-            if ($s.ProxyServer) {
-                Set-ItemProperty -Path $reg -Name ProxyServer -Value $s.ProxyServer
+            $srv = [string]$s.ProxyServer
+            $pac = [string]$s.AutoConfigURL
+            $en = [int]$s.ProxyEnable
+            if ((Test-IsSelfProxyValue $srv) -or (Test-IsSelfProxyValue $pac)) {
+                $en = 0
+                $srv = ""
+                $pac = ""
+            }
+            Set-ItemProperty -Path $reg -Name ProxyEnable -Value $en
+            if ($srv) {
+                Set-ItemProperty -Path $reg -Name ProxyServer -Value $srv
             } else {
                 Remove-ItemProperty -Path $reg -Name ProxyServer -ErrorAction SilentlyContinue
             }
-            if ($s.ProxyOverride) {
+            if ($s.ProxyOverride -and -not (Test-IsSelfProxyValue $srv)) {
                 Set-ItemProperty -Path $reg -Name ProxyOverride -Value $s.ProxyOverride
             } else {
                 Remove-ItemProperty -Path $reg -Name ProxyOverride -ErrorAction SilentlyContinue
             }
-            if ($s.AutoConfigURL) {
-                Set-ItemProperty -Path $reg -Name AutoConfigURL -Value $s.AutoConfigURL
+            if ($pac) {
+                Set-ItemProperty -Path $reg -Name AutoConfigURL -Value $pac
             } else {
                 Remove-ItemProperty -Path $reg -Name AutoConfigURL -ErrorAction SilentlyContinue
             }
@@ -530,10 +548,14 @@ function Restore-OriginalProxyState {
             Remove-Item $ProxyStateFile -Force
         } catch {
             Set-ItemProperty -Path $reg -Name ProxyEnable -Value 0
+            Remove-ItemProperty -Path $reg -Name ProxyServer -ErrorAction SilentlyContinue
+            Remove-ItemProperty -Path $reg -Name AutoConfigURL -ErrorAction SilentlyContinue
             Remove-Item $ProxyStateFile -Force -ErrorAction SilentlyContinue
         }
     } else {
         Set-ItemProperty -Path $reg -Name ProxyEnable -Value 0
+        Remove-ItemProperty -Path $reg -Name ProxyServer -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $reg -Name AutoConfigURL -ErrorAction SilentlyContinue
     }
 
     if ($hasWinHttp) {
@@ -959,6 +981,10 @@ function Set-SystemProxy {
 function Unset-SystemProxy {
     Write-Host "  [*] 正在恢复系统代理..." -ForegroundColor Yellow
     Remove-Item $ActiveFlag -Force -ErrorAction SilentlyContinue
+    if (Test-Path $TunActiveFlag) {
+        Write-Host "  [提示] TUN 模式仍在运行，保留其系统代理设置与看门狗" -ForegroundColor Yellow
+        return
+    }
     Stop-Watchdog
     $restored = $true
     try {
@@ -1270,6 +1296,9 @@ function Stop-Tun {
     Write-Host "  [*] 正在停止 TUN/VPN 服务..." -ForegroundColor Yellow
 
     if (Test-Path $TunActiveFlag) {
+        if (-not (Test-Path $ActiveFlag)) {
+            Stop-Watchdog
+        }
         Remove-Item $TunActiveFlag -Force -ErrorAction SilentlyContinue
         if (-not (Test-Path $ActiveFlag)) {
             Restore-OriginalProxyState
@@ -1394,10 +1423,10 @@ function Start-Tun {
     }
 
     if ($setSysProxy) {
+        Stop-Watchdog
         Save-OriginalProxyState
         if (Test-Path $ActiveFlag) {
             Remove-Item $ActiveFlag -Force -ErrorAction SilentlyContinue
-            Stop-Watchdog
         }
         $reg = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
         Remove-ItemProperty -Path $reg -Name AutoConfigURL -ErrorAction SilentlyContinue
@@ -1408,7 +1437,8 @@ function Start-Tun {
         Set-ItemProperty -Path $reg -Name ProxyOverride -Value $bypass
         Refresh-WinINet
         Set-Content -Path $TunActiveFlag -Value (Get-Date).ToString("s") -Encoding ASCII
-        Write-Host "  [OK] 系统代理已同步指向 TUN 混合端口 127.0.0.1:$mixedPort" -ForegroundColor Green
+        Start-Watchdog
+        Write-Host "  [OK] 系统代理已同步指向 TUN 混合端口 127.0.0.1:$mixedPort（已启用掉线自动恢复直连守护）" -ForegroundColor Green
     }
 
     Start-Sleep -Milliseconds 500
