@@ -117,7 +117,7 @@ class TunServiceTests(unittest.TestCase):
         cfg["port"] = 18081
         cfg["protocol"] = "socks5"
         cfg["username"] = "tester"
-        cfg["password"] = "HzbwbNVYZFS"
+        cfg["password"] = "test-pass"
         cfg["rules"] = [
             {"enabled": True, "type": "DOMAIN-SUFFIX", "value": "edu.cn", "policy": "DIRECT"},
             {"enabled": False, "type": "DOMAIN", "value": "disabled.example.com", "policy": "PROXY"},

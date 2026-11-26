@@ -24,6 +24,7 @@ DEFAULTS = {
     "log_level_filter": 0,      # 日志中心默认级别筛选（combo 索引）
     "log_retention_days": 14,
     "mask_diagnostics": True,   # 诊断报告 IP 脱敏
+    "auto_check_updates": True, # 启动时自动检查 GitHub 新版本
     "last_diag_time": "",
     "last_diag_summary": "",
 }

@@ -6,9 +6,10 @@ Threading rules (design doc §5.4):
 - the GUI never blocks; overlapping mutations are refused while busy.
 """
 
+import sys
 import time
 
-from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtCore import QRectF, QSettings, Qt, QTimer
 from PySide6.QtGui import (
     QBrush, QColor, QIcon, QLinearGradient, QPainter, QPainterPath, QPen,
     QPixmap, QRadialGradient,
@@ -32,8 +33,8 @@ from gui.pages.tun import TunPage
 from gui.settings_store import SettingsStore
 from gui.sidebar import Sidebar
 from gui.workers import FuncWorker
-from services import process_manager
-from services.config_manager import APP_NAME
+from services import process_manager, update_service
+from services.config_manager import APP_NAME, ORG_NAME
 from services.status_monitor import collect_snapshot
 from sni_proxy.config import VERSION
 
@@ -92,6 +93,7 @@ class MainWindow(QMainWindow):
         self._action_stalled = False
         self._snap_worker = None
         self._action_worker = None
+        self._update_check_worker = None
         self._workers = []
 
         # 操作超时兜底：后台动作卡死时也要解锁界面，避免按钮永久置灰
@@ -161,6 +163,55 @@ class MainWindow(QMainWindow):
         self.poll_timer.timeout.connect(self.refresh_now)
         self.poll_timer.start()
         self.refresh_now()
+        QTimer.singleShot(5000, self._auto_check_update)
+
+    # ------------------------------------------------------- update check
+    def _auto_check_update(self):
+        """Check GitHub at most once per 6 hours; never block the GUI."""
+        if not getattr(sys, "frozen", False):
+            return
+        if not self.settings.get("auto_check_updates", True):
+            return
+        qs = None
+        try:
+            qs = QSettings(ORG_NAME, APP_NAME)
+            last = int(qs.value("update/last_check", 0) or 0)
+            if time.time() - last < 6 * 3600:
+                return
+            qs.setValue("update/last_check", int(time.time()))
+        except Exception:
+            qs = None
+        if self._update_check_worker is not None:
+            try:
+                if self._update_check_worker.isRunning():
+                    return
+            except RuntimeError:
+                self._update_check_worker = None
+        self._update_check_worker = self._track_worker(
+            FuncWorker(lambda progress: update_service.fetch_latest(), parent=self),
+            "_update_check_worker")
+        self._update_check_worker.done.connect(
+            lambda result, error: self._on_auto_update_result(result, error, qs))
+        self._update_check_worker.start()
+
+    def _on_auto_update_result(self, result, error, qs):
+        if error or not result:
+            return
+        ver = result.get("version") or ""
+        if not update_service.is_newer(ver):
+            return
+        try:
+            if qs is not None and qs.value("update/skipped_version", "") == ver:
+                return
+        except Exception:
+            pass
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.showMessage(
+                "发现新版本",
+                f"toci v{ver} 已发布，可在「设置中心」一键更新。",
+                QSystemTrayIcon.Information, 6000)
+        if self.isVisible() and not self.isMinimized():
+            self.settings_page.prompt_update(result)
 
     # ------------------------------------------------------------ window
     def _init_window_size(self):

@@ -1,0 +1,45 @@
+{
+  "version": "1.0",
+  "server": "",
+  "port": 18081,
+  "protocol": "socks5",
+  "username": "",
+  "password": "",
+  "mode": "rule",
+  "udp": true,
+  "stack": "gvisor",
+  "fake_ip": true,
+  "dns_servers": [
+    "223.5.5.5",
+    "119.29.29.29"
+  ],
+  "bypass_lan": true,
+  "also_set_sys_proxy": true,
+  "mixed_port": 17897,
+  "api_port": 19090,
+  "device_name": "SNI-Proxy-TUN",
+  "final_policy": "PROXY",
+  "rules": [
+    {
+      "enabled": true,
+      "type": "DOMAIN-SUFFIX",
+      "value": "edu.cn",
+      "policy": "DIRECT",
+      "comment": "高校内网/教务系统直连"
+    },
+    {
+      "enabled": true,
+      "type": "DOMAIN-SUFFIX",
+      "value": "local",
+      "policy": "DIRECT",
+      "comment": "局域网本地域名直连"
+    },
+    {
+      "enabled": true,
+      "type": "PROCESS-NAME",
+      "value": "gost.exe",
+      "policy": "DIRECT",
+      "comment": "防止本地服务端代理回环"
+    }
+  ]
+}

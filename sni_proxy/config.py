@@ -4,7 +4,7 @@ import os
 import shutil
 import sys
 
-VERSION = "3.0.0"
+VERSION = "3.5.0"
 
 LISTEN_HOST = "127.0.0.1"
 # 允许测试时用环境变量换端口，避免影响正在运行的 8888 实例
@@ -72,6 +72,20 @@ BLOCKED_SUFFIXES = [
 # Routed through the proxy but tunneled without MITM (upstream keeps its own
 # certificate). Populated from rules.json at startup.
 PASSTHROUGH_SUFFIXES = []
+
+# Plain-HTTP requests to these domains are transparently upgraded to HTTPS.
+# The campus firewall lets the TCP handshake through but silently drops HTTP
+# requests whose URL ends in a video extension (.m3u8 / .ts) — the client
+# connects, sends the request and then waits forever. The same CDN serves the
+# identical object over TLS, which the firewall does not inspect, so the proxy
+# re-issues the request on port 443. Populated from rules.json at startup.
+HTTP_UPGRADE_SUFFIXES = []
+
+# Hosts inside a rewritten m3u8 playlist whose https URIs become http. Their
+# TCP/443 edge is black-holed on campus while the same object is served on
+# port 80 (e.g. the AES key host s3plus.meituan.net). Populated from
+# rules.json at startup.
+HTTP_DOWNGRADE_SUFFIXES = []
 
 # Per-domain upstream TLS overrides, populated from rules.json at startup:
 #   upstream_port_overrides: alternate upstream TLS port. The campus firewall

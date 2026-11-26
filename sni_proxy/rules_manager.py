@@ -43,6 +43,17 @@ DEFAULT_RULES = {
         "trae.cn", "trae.com.cn", "mchost.guru", "bytednsdoc.com", "bdurl.net",
         "fe-static.deepseek.com", "cdn.deepseek.com",
     ],
+    # 明文 HTTP 请求自动升级为 HTTPS：校园网 DPI 对 .m3u8/.ts 等视频地址
+    # 握手放行、请求丢弃（客户端一直无响应），同一 CDN 的 443 端口正常。
+    "http_upgrade_suffixes": [
+        "hzhcbkj.cn",
+    ],
+    # m3u8 播放列表里这些主机的 https 地址改写成 http：校园网对它们的
+    # 443 端口黑洞，但同一对象在 80 端口可正常获取（如 AES key 的
+    # s3plus.meituan.net）。
+    "http_downgrade_suffixes": [
+        "meituan.net",
+    ],
     # 域名(或后缀) -> 上游备用 TLS 端口：校园网只封 443 时，同一 WAF 常在
     # 备用端口上完整服务站点（如 chat.deepseek.com -> 8443）
     "upstream_port_overrides": {
@@ -207,6 +218,12 @@ def load_rules(force=False):
         config.PASSTHROUGH_SUFFIXES = [
             _normalize_suffix(s) for s in rules.get("passthrough_suffixes", []) if s
         ]
+        config.HTTP_UPGRADE_SUFFIXES = [
+            _normalize_suffix(s) for s in rules.get("http_upgrade_suffixes", []) if s
+        ]
+        config.HTTP_DOWNGRADE_SUFFIXES = [
+            _normalize_suffix(s) for s in rules.get("http_downgrade_suffixes", []) if s
+        ]
         config.SNI_REWRITE = dict(rules.get("sni_rewrite", {}))
         config.ALLOWED_SNI_POOL = list(rules.get("allowed_sni_pool", []))
         config.PROXY_MODE = rules.get("proxy_mode", "pac")
@@ -247,6 +264,12 @@ def save_rules(rules):
         ]
         config.PASSTHROUGH_SUFFIXES = [
             _normalize_suffix(s) for s in rules.get("passthrough_suffixes", []) if s
+        ]
+        config.HTTP_UPGRADE_SUFFIXES = [
+            _normalize_suffix(s) for s in rules.get("http_upgrade_suffixes", []) if s
+        ]
+        config.HTTP_DOWNGRADE_SUFFIXES = [
+            _normalize_suffix(s) for s in rules.get("http_downgrade_suffixes", []) if s
         ]
         config.SNI_REWRITE = dict(rules.get("sni_rewrite", {}))
         config.ALLOWED_SNI_POOL = list(rules.get("allowed_sni_pool", []))

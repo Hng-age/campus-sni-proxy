@@ -1,0 +1,106 @@
+{
+  "version": "3.5.0",
+  "updated_at": "2026-11-26 21:03:30",
+  "proxy_mode": "pac",
+  "pac_port": 8888,
+  "blocked_suffixes": [
+    "douyin.com",
+    "iesdouyin.com",
+    "douyinpic.com",
+    "douyincdn.com",
+    "douyinvod.com",
+    "douyinstatic.com",
+    "douyinvideo.net",
+    "douyinlives.com",
+    "amemv.com",
+    "bytedance.com",
+    "byted.org",
+    "bytecdn.cn",
+    "snssdk.com",
+    "zijieapi.com",
+    "zijiecdn.com",
+    "toutiao.com",
+    "ixigua.com",
+    "pstatp.com",
+    "bilibili.com",
+    "biligame.com",
+    "hdslb.com",
+    "biliapi.net",
+    "biliapi.com",
+    "acgvideo.com",
+    "bilivideo.com",
+    "bilivideo.cn",
+    "bvcip.com",
+    "xiaohongshu.com",
+    "xhscdn.com",
+    "doubao.com",
+    "kuaishou.com",
+    "yximgs.com",
+    "iqiyi.com",
+    "iqiyipic.com",
+    "youku.com",
+    "ximalaya.com",
+    "xmcdn.com",
+    "v.qq.com",
+    "imgcache.qq.com",
+    "vm.gtimg.cn",
+    "puui.qpic.cn",
+    "tv.sohu.com",
+    "ifeng.com",
+    "ifengimg.com",
+    "douban.com",
+    "doubanio.com",
+    "huawei.com",
+    "bing.com",
+    "bing.net",
+    "cn.bing.com",
+    "chat.deepseek.com",
+    "platform.deepseek.com",
+    "harness.deepseek.com"
+  ],
+  "sni_rewrite": {
+    "www.douyin.com": "douyin.com",
+    "www.bilibili.com": "bilibili.com",
+    "www.xiaohongshu.com": "xiaohongshu.com",
+    "live.douyin.com": "douyin.com",
+    "www.ixigua.com": "ixigua.com"
+  },
+  "allowed_sni_pool": [
+    "www.zhihu.com",
+    "douyin.com",
+    "bilibili.com",
+    "www.baidu.com",
+    "www.qq.com",
+    "www.163.com",
+    "www.weibo.com"
+  ],
+  "extra_wildcard_bases": [
+    "mcdn.bilivideo.cn",
+    "mcdn.bilivideo.com"
+  ],
+  "passthrough_suffixes": [
+    "trae.cn",
+    "trae.com.cn",
+    "mchost.guru",
+    "bytednsdoc.com",
+    "bdurl.net",
+    "fe-static.deepseek.com",
+    "cdn.deepseek.com"
+  ],
+  "http_upgrade_suffixes": [
+    "hzhcbkj.cn"
+  ],
+  "http_downgrade_suffixes": [
+    "meituan.net"
+  ],
+  "upstream_port_overrides": {
+    "chat.deepseek.com": 8443,
+    "platform.deepseek.com": 8443,
+    "harness.deepseek.com": 8443
+  },
+  "upstream_cert_pins": {
+    "chat.deepseek.com": "535025736b94bc66bb0c94bd8e1fee4f1ea50e26008db9af07a679d5714b39aa",
+    "platform.deepseek.com": "535025736b94bc66bb0c94bd8e1fee4f1ea50e26008db9af07a679d5714b39aa",
+    "harness.deepseek.com": "535025736b94bc66bb0c94bd8e1fee4f1ea50e26008db9af07a679d5714b39aa"
+  }
+}

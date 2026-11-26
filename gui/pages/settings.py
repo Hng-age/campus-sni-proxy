@@ -1,17 +1,21 @@
 """设置中心页：系统与托盘（含开机自启开关）、外观、日志与安全、关于软件。"""
 
+import os
+import sys
 import time
 
-from PySide6.QtCore import QRectF, QSignalBlocker, Qt
+from PySide6.QtCore import QRectF, QSettings, QSignalBlocker, Qt
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QLabel,
+    QMessageBox, QProgressDialog, QPushButton, QScrollArea, QSlider,
+    QSpinBox, QVBoxLayout, QWidget,
 )
 
 from gui.components.glass_panel import GlassPanel, KVGrid
-from services import config_manager
-from sni_proxy.config import VERSION
+from gui.workers import FuncWorker
+from services import config_manager, update_service
+from sni_proxy.config import BASE_DIR, VERSION
 from .base import Page
 
 LOG_LEVELS = ("全部", "INFO 及以上", "WARNING 及以上", "仅 ERROR", "含 DEBUG")
@@ -273,6 +277,29 @@ class SettingsPage(Page):
         self.env_grid.add_row("证书引擎", "--", "crypto")
         self.env_grid.add_row("本地监听地址", "--", "listen")
         panel.add(self.env_grid)
+
+        upd_row = QHBoxLayout()
+        upd_row.setSpacing(10)
+        self.btn_update = QPushButton("检查更新")
+        self.btn_update.setObjectName("SecondaryBtnSmall")
+        self.btn_update.setCursor(Qt.PointingHandCursor)
+        self.btn_update.clicked.connect(self._on_update_button)
+        self.lab_update = QLabel("启动后会自动检查 GitHub 新版本")
+        self.lab_update.setObjectName("TinyLabel")
+        self.lab_update.setWordWrap(True)
+        upd_row.addWidget(self.btn_update)
+        upd_row.addWidget(self.lab_update, 1)
+        panel.add_layout(upd_row)
+
+        self.check_auto_update = ToggleSwitch("启动时自动检查更新")
+        self.check_auto_update.setChecked(
+            bool(self.ctx.settings.get("auto_check_updates", True)))
+        self.check_auto_update.toggled.connect(self._auto_update_changed)
+        panel.add(self.check_auto_update)
+
+        self._update_info = None
+        self._update_busy = False
+        self._update_threads = []
         self._load_env_info()
         return panel
 
@@ -352,6 +379,187 @@ class SettingsPage(Page):
         self.ctx.settings.set("mask_diagnostics", bool(checked))
         self._saved("诊断脱敏")
 
+    # ------------------------------------------------------- 版本更新
+    def _auto_update_changed(self, checked):
+        self.ctx.settings.set("auto_check_updates", bool(checked))
+        self._saved("自动检查更新")
+
+    def _on_update_button(self):
+        info = self._update_info
+        if info and update_service.is_newer(info.get("version")):
+            self.prompt_update(info)
+            return
+        self.check_update(auto=False)
+
+    def check_update(self, auto=False):
+        """Check GitHub for a newer release (runs in a worker thread)."""
+        if self._update_busy:
+            return
+        self._update_busy = True
+        self.btn_update.setEnabled(False)
+        self.btn_update.setText("检查中…")
+        self.lab_update.setText("正在连接 GitHub 检查新版本…")
+        worker = FuncWorker(lambda progress: update_service.fetch_latest())
+        self._update_threads.append(worker)
+        worker.done.connect(
+            lambda result, error: self._on_update_checked(result, error, auto))
+        worker.finished.connect(lambda w=worker: self._release_update_thread(w))
+        worker.start()
+
+    def _release_update_thread(self, worker):
+        self._update_busy = False
+        try:
+            self._update_threads.remove(worker)
+        except ValueError:
+            pass
+        worker.deleteLater()
+
+    def _on_update_checked(self, result, error, auto):
+        self.btn_update.setEnabled(True)
+        self.btn_update.setText("检查更新")
+        if error or not result:
+            msg = str(error or "未知错误")
+            self.lab_update.setText("检查失败：" + msg[:60])
+            self.lab_update.setToolTip(msg)
+            if not auto:
+                QMessageBox.warning(
+                    self, "检查更新失败",
+                    f"无法获取最新版本信息：\n\n{msg}")
+            return
+        ver = result.get("version") or ""
+        notes = result.get("notes") or ""
+        self.lab_update.setToolTip(notes)
+        if update_service.is_newer(ver):
+            self._update_info = result
+            self.lab_update.setText(f"发现新版本 v{ver}（当前 v{VERSION}）")
+            if auto:
+                self.prompt_update(result)
+        else:
+            self._update_info = None
+            self.lab_update.setText(f"已是最新版本 v{VERSION}")
+            if not auto:
+                QMessageBox.information(
+                    self, "检查更新", f"当前已是最新版本 v{VERSION}。")
+
+    def prompt_update(self, info):
+        """Ask the user whether to install *info*; used by the auto check too."""
+        ver = info.get("version") or ""
+        if not update_service.is_newer(ver):
+            return
+        self._update_info = info
+        box = QMessageBox(self)
+        box.setWindowTitle("发现新版本")
+        box.setText(f"toci v{ver} 已发布（当前 v{VERSION}）")
+        box.setInformativeText(
+            "是否现在下载并更新？更新完成后应用会自动重启；"
+            "日志、证书、线路配置和规则文件都会保留。")
+        box.setDetailedText(info.get("notes") or "")
+        yes = box.addButton("立即更新", QMessageBox.AcceptRole)
+        box.addButton("稍后", QMessageBox.RejectRole)
+        box.setDefaultButton(yes)
+        box.exec()
+        if box.clickedButton() is yes:
+            self._start_update(info)
+        else:
+            try:
+                qs = QSettings(config_manager.ORG_NAME, config_manager.APP_NAME)
+                qs.setValue("update/skipped_version", ver)
+            except Exception:
+                pass
+
+    def _start_update(self, info):
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(
+                self, "源码模式",
+                "自动替换仅在打包版本中启用。\n"
+                "当前是源码运行，请直接更新代码或使用发布包。")
+            return
+        try:
+            qs = QSettings(config_manager.ORG_NAME, config_manager.APP_NAME)
+            qs.remove("update/skipped_version")
+        except Exception:
+            pass
+        dlg = QProgressDialog("正在下载更新…", "取消", 0, 100, self)
+        dlg.setWindowTitle("软件更新")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        cancel = {"value": False}
+        dlg.canceled.connect(lambda: cancel.__setitem__("value", True))
+        self.btn_update.setEnabled(False)
+        self.btn_update.setText("更新中…")
+
+        def job(progress):
+            def on_progress(done, total, stage):
+                progress({"done": done, "total": total, "stage": stage})
+            return update_service.download_and_stage(
+                info, on_progress, lambda: cancel["value"])
+
+        worker = FuncWorker(job)
+        self._update_threads.append(worker)
+        worker.progress.connect(lambda data: self._update_progress(dlg, data))
+        worker.done.connect(
+            lambda result, error: self._on_update_ready(dlg, result, error))
+        worker.finished.connect(lambda w=worker: self._release_update_thread(w))
+        worker.start()
+        dlg.exec()
+
+    @staticmethod
+    def _update_progress(dlg, data):
+        if not isinstance(data, dict):
+            return
+        if data.get("stage") == "extract":
+            dlg.setLabelText("正在解压并校验更新包…")
+            dlg.setValue(99)
+            return
+        done = int(data.get("done") or 0)
+        total = int(data.get("total") or 0)
+        mb = 1024 * 1024
+        if total > 0:
+            dlg.setValue(min(98, int(done * 100 / total)))
+            dlg.setLabelText(
+                f"正在下载更新… {done / mb:.1f} / {total / mb:.1f} MB")
+        else:
+            dlg.setLabelText(f"正在下载更新… {done / mb:.1f} MB")
+
+    def _on_update_ready(self, dlg, result, error):
+        try:
+            dlg.close()
+        except Exception:
+            pass
+        self.btn_update.setEnabled(True)
+        self.btn_update.setText("检查更新")
+        if error or not result:
+            msg = str(error or "下载失败")
+            if "已取消" in msg:
+                self.lab_update.setText("已取消更新")
+                return
+            self.lab_update.setText("更新失败：" + msg[:50])
+            self.lab_update.setToolTip(msg)
+            QMessageBox.warning(
+                self, "更新失败",
+                f"{msg}\n\n可稍后重试，或手动从 GitHub Releases 下载。")
+            return
+        QMessageBox.information(
+            self, "更新已就绪",
+            "更新包已下载并校验完成。\n\n"
+            "点击“确定”后应用将退出，自动替换程序文件并重新启动；"
+            "本机日志、证书和线路配置不会被覆盖。")
+        try:
+            log_path = update_service.apply_update(
+                result["app_root"], BASE_DIR,
+                wait_pid=os.getpid(), work_dir=result["work_dir"])
+        except Exception as e:      # noqa: BLE001
+            QMessageBox.warning(
+                self, "更新启动失败",
+                f"{e}\n\n请手动从 GitHub Releases 下载安装包。")
+            return
+        self.lab_update.setToolTip("更新日志：" + log_path)
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
     # ------------------------------------------------------- 外部同步
     def on_settings_changed(self, settings):
         with QSignalBlocker(self.combo_theme):
@@ -378,3 +586,6 @@ class SettingsPage(Page):
             self.check_tray.setChecked(bool(settings.get("minimize_to_tray", True)))
         with QSignalBlocker(self.check_mask):
             self.check_mask.setChecked(bool(settings.get("mask_diagnostics", True)))
+        with QSignalBlocker(self.check_auto_update):
+            self.check_auto_update.setChecked(
+                bool(settings.get("auto_check_updates", True)))

@@ -27,6 +27,7 @@ from .logsetup import log, log_error, log_warning
 from .netutil import wildcard_covers
 
 _cert_lock = threading.Lock()
+_user_sid_cache = None
 
 # cert generation failure tombstones: domain -> timestamp (avoid flash loops)
 _cert_fail = {}
@@ -82,6 +83,9 @@ def ensure_cert_dir():
 
 def _current_user_sid():
     """Return the current Windows user SID, or None."""
+    global _user_sid_cache
+    if _user_sid_cache:
+        return _user_sid_cache
     try:
         raw = subprocess.run(
             ["whoami", "/user", "/fo", "csv", "/nh"],
@@ -91,6 +95,7 @@ def _current_user_sid():
         for part in out.replace('"', "").split(","):
             part = part.strip()
             if part.startswith("S-1-5-"):
+                _user_sid_cache = part
                 return part
     except Exception:
         pass
@@ -136,11 +141,11 @@ def _set_restricted_dacl(path, sid):
             _kernel32.LocalFree(p)
 
 
-def harden_key_acl(path):
+def harden_key_acl(path, sid=None):
     """Restrict a private key file to current user + Administrators + SYSTEM."""
     if os.name != "nt" or not os.path.exists(path):
         return False
-    sid = _current_user_sid()
+    sid = sid or _current_user_sid()
     if not sid:
         log_warning(f"cannot resolve current user SID for {os.path.basename(path)}")
         return False
@@ -153,17 +158,25 @@ def harden_key_acl(path):
 
 
 def harden_existing_keys():
-    """Apply the restricted ACL to private keys already on disk (once)."""
-    if not os.path.isdir(config.CERT_DIR):
+    """Re-apply the restricted ACL to every private key on disk.
+
+    目录被复制、解压或重新打包后，私钥会重新继承父目录的宽松 ACL，
+    一次性标记不可靠，因此每次启动都无条件重放（幂等且开销极小）。
+    """
+    if os.name != "nt" or not os.path.isdir(config.CERT_DIR):
         return 0
-    marker = os.path.join(config.CERT_DIR, ".acl_hardened")
-    if os.path.exists(marker):
+    sid = _current_user_sid()
+    if not sid:
+        log_warning("cannot resolve current user SID; skip private key ACL hardening")
         return 0
     count = 0
     for name in os.listdir(config.CERT_DIR):
-        if name.endswith(".key") and harden_key_acl(
-                os.path.join(config.CERT_DIR, name)):
+        if not name.endswith(".key"):
+            continue
+        path = os.path.join(config.CERT_DIR, name)
+        if harden_key_acl(path, sid):
             count += 1
+    marker = os.path.join(config.CERT_DIR, ".acl_hardened")
     try:
         with open(marker, "w", encoding="ascii") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n")

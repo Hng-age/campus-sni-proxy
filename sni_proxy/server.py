@@ -1,6 +1,7 @@
 """Proxy server: CONNECT handling, MITM/passthrough forwarding, main loop."""
 
 import os
+import re
 import socket
 import ssl
 import sys
@@ -248,6 +249,199 @@ def _read_http_body(client_sock, initial, lines):
     return body
 
 
+_upgrade_ctx = None
+_upgrade_ctx_lock = threading.Lock()
+
+
+def _upgrade_context():
+    """TLS context for HTTP→HTTPS upgrades.
+
+    Video CDN edges serve the original Host over TLS with a shared edge
+    certificate (e.g. *.cdn.myqcloud.com), so the chain is verified but the
+    hostname is not: the certificate never covers the per-video CDN alias.
+    """
+    global _upgrade_ctx
+    with _upgrade_ctx_lock:
+        if _upgrade_ctx is None:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            try:
+                ctx.set_alpn_protocols(["http/1.1"])
+            except Exception:
+                pass
+            _upgrade_ctx = ctx
+        return _upgrade_ctx
+
+
+_PLAYLIST_MAX = 8 * 1024 * 1024
+_PLAYLIST_URI_RX = re.compile(rb"https://([A-Za-z0-9.\-]+)")
+
+
+def _read_playlist_response(tls):
+    """Read the response head; return (lines, body, raw).
+
+    ``body`` is only set for a rewriteable 200 response; otherwise ``raw``
+    carries the bytes already received so the caller can relay them as-is.
+    """
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = tls.recv(65536)
+        if not chunk:
+            return None, None, buf
+        buf += chunk
+        if len(buf) > 65536:
+            return None, None, buf
+
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    raw = head + b"\r\n\r\n" + rest
+    lines = head.decode("iso-8859-1").split("\r\n")
+    status = lines[0].split(" ", 2)
+    if len(status) < 2 or status[1] != "200":
+        return None, None, raw
+
+    length = None
+    for line in lines[1:]:
+        lower = line.lower()
+        if lower.startswith("transfer-encoding:") and "chunked" in lower:
+            return None, None, raw
+        if lower.startswith("content-length:"):
+            try:
+                length = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                return None, None, raw
+    if length is None or length > _PLAYLIST_MAX:
+        return None, None, raw
+
+    body = rest
+    while len(body) < length:
+        chunk = tls.recv(65536)
+        if not chunk:
+            return None, None, raw
+        body += chunk
+    return lines, body[:length], raw
+
+
+def _rewrite_playlist(host, body):
+    """Downgrade URIs of hosts whose TLS edge is black-holed (see config)."""
+    suffixes = config.HTTP_DOWNGRADE_SUFFIXES
+    if not suffixes:
+        return None
+
+    def repl(match):
+        target = match.group(1).decode("ascii", "ignore").lower()
+        if matches_suffix(target, suffixes):
+            return b"http://" + match.group(1)
+        return match.group(0)
+
+    rewritten = _PLAYLIST_URI_RX.sub(repl, body)
+    if rewritten == body:
+        return None
+    log_debug(f"playlist downgrade {host}: {len(body)} -> {len(rewritten)} bytes")
+    return rewritten
+
+
+def _send_rewritten_playlist(client_sock, lines, body):
+    kept = [lines[0]]
+    for line in lines[1:]:
+        lower = line.lower()
+        if lower.startswith(("content-length:", "connection:",
+                             "transfer-encoding:")):
+            continue
+        kept.append(line)
+    kept.append("Content-Length: " + str(len(body)))
+    kept.append("Connection: close")
+    client_sock.sendall(("\r\n".join(kept) + "\r\n\r\n").encode("iso-8859-1")
+                        + body)
+
+
+def handle_http_upgrade(client_sock, host, path, lines, body):
+    """Re-issue a plain-HTTP request over TLS (port 443) and relay the reply."""
+    tls = None
+    raw = None
+    try:
+        ips = resolve_system(host)
+        for ip in resolve_domain(host):
+            if ip not in ips:
+                ips.append(ip)
+        if not ips:
+            client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            client_sock.close()
+            return
+
+        is_playlist = path.split("?")[0].lower().endswith(".m3u8")
+        headers = []
+        has_host = False
+        for line in lines[1:]:
+            lower = line.lower()
+            if lower.startswith(("proxy-connection:", "proxy-authorization:",
+                                 "connection:")):
+                continue
+            # 播放器探测时必带 Range: bytes=0-，CDN 会回 206 分片响应，
+            # 无法整体改写；去掉 Range 拿 200 完整播放列表。
+            if is_playlist and lower.startswith("range:"):
+                continue
+            if lower.startswith("host:"):
+                has_host = True
+            headers.append(line)
+        if not has_host:
+            headers.insert(0, f"Host: {host}")
+        # 每个升级请求翻成一个独立的短连接，响应读完即关，转发放到
+        # forward_bidirectional 里直到任一端断开
+        headers.append("Connection: close")
+        payload = (lines[0] + "\r\n" + "\r\n".join(headers)
+                   + "\r\n\r\n").encode("iso-8859-1") + body
+
+        raw = connect_any(ips, 443, timeout=4, deadline=7)
+        if raw is None:
+            log_debug(f"http->https {host}: connect failed ({len(ips)} ips)")
+            client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            client_sock.close()
+            return
+
+        try:
+            tls = _upgrade_context().wrap_socket(raw, server_hostname=host)
+        finally:
+            if tls is None:
+                raw.close()
+        raw = None
+        tls.sendall(payload)
+        tls.settimeout(20)
+        log_debug(f"http->https upgrade {host}{path}")
+
+        # m3u8 里可能出现 443 被黑洞、80 可用的主机（如 AES key），
+        # 把小体积播放列表完整读回并改写后再发给播放器。
+        if is_playlist:
+            resp_lines, resp_body, resp_raw = _read_playlist_response(tls)
+            if resp_lines is not None:
+                rewritten = _rewrite_playlist(host, resp_body)
+                _send_rewritten_playlist(
+                    client_sock, resp_lines, rewritten or resp_body)
+                return
+            if resp_raw:
+                client_sock.sendall(resp_raw)
+                tls.settimeout(None)
+                forward_bidirectional(client_sock, tls)
+                tls = None
+            return
+
+        tls.settimeout(None)
+        forward_bidirectional(client_sock, tls)
+        tls = None
+    except Exception as e:
+        if _is_disconnect(e):
+            log_debug(f"http->https {host} closed: {e}")
+        else:
+            log_error(f"http->https {host}: {e}")
+    finally:
+        for s in (client_sock, tls, raw):
+            try:
+                if s:
+                    s.close()
+            except Exception:
+                pass
+
+
 def handle_http_request(client_sock, request):
     try:
         from urllib.parse import urlparse
@@ -268,6 +462,15 @@ def handle_http_request(client_sock, request):
 
         body = _read_http_body(client_sock, body, lines)
         lines[0] = f"{first_line.split(' ')[0]} {path} HTTP/1.1"
+
+        # 校园网 DPI 对明文 HTTP 的视频地址（.m3u8/.ts）只放行握手、随后
+        # 丢弃请求，客户端因此永远等不到响应；同一 CDN 的 TLS 端口不受
+        # 影响，这里把请求原样改走 HTTPS 重新发起。
+        if port == 80 and host and matches_suffix(
+                host, config.HTTP_UPGRADE_SUFFIXES):
+            handle_http_upgrade(client_sock, host, path, lines, body)
+            return
+
         payload = ("\r\n".join(lines).encode("iso-8859-1")
                    + b"\r\n\r\n" + body)
 

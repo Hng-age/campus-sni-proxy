@@ -1,4 +1,4 @@
-"""toci - 校园网 SNI 代理 GUI 入口（v3.0.0）。
+"""toci - 校园网 SNI 代理 GUI 入口（v3.5.0）。
 
 用法：
     python main.py              启动桌面 GUI
