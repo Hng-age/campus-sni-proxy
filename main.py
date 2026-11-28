@@ -1,8 +1,10 @@
-"""toci - 校园网 SNI 代理 GUI 入口（v3.5.0）。
+"""toci - 校园网 SNI 代理 GUI 入口（v3.5.1）。
 
 用法：
     python main.py              启动桌面 GUI
-    python main.py --version   打印版本并退出
+    python main.py --version    打印版本并退出
+    python main.py --proxy      无头运行 SNI 代理核心
+    python main.py --init-certs 初始化设备根证书与通配符证书并退出
 
 命令行管理入口保留：SNI代理_一键启动.bat / start.bat（原菜单）。
 """
@@ -48,6 +50,25 @@ def main():
                 print(f"toci v{VERSION}")
             except Exception:
                 pass
+            return 0
+
+        if "--init-certs" in sys.argv:
+            from sni_proxy.certs import ensure_identity
+            from sni_proxy.config import CA_CERT, WILDCARD_CERT
+            from sni_proxy.logsetup import log, log_error
+            try:
+                ensure_identity()
+                ok = os.path.exists(CA_CERT) and os.path.exists(WILDCARD_CERT)
+                log(f"identity ready: ca={os.path.exists(CA_CERT)} "
+                    f"wildcard={os.path.exists(WILDCARD_CERT)}")
+                return 0 if ok else 2
+            except Exception as e:
+                log_error(f"init-certs failed: {e}")
+                return 1
+
+        if "--proxy" in sys.argv:
+            from sni_proxy.server import main as run_proxy_server
+            run_proxy_server()
             return 0
 
         from PySide6.QtCore import Qt

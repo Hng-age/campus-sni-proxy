@@ -44,6 +44,12 @@ class TunServiceTests(unittest.TestCase):
         self.assertEqual(saved["server"], "192.168.1.10")
         self.assertTrue(os.path.exists(tun_service.TUN_YAML_FILE))
 
+        if os.name == "nt":
+            with open(tun_service.TUN_CONFIG_FILE, "r", encoding="utf-8") as f:
+                disk_raw = f.read()
+            self.assertNotIn('p@ss:"word#1', disk_raw)
+            self.assertIn("dpapi:", disk_raw)
+
         reloaded = tun_service.load_tun_config()
         self.assertEqual(reloaded["password"], 'p@ss:"word#1')
         self.assertEqual(reloaded["mode"], "global")

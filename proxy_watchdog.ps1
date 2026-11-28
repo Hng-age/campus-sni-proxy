@@ -12,6 +12,13 @@ $reg = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 $winKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections"
 
 function Write-Log([string]$msg) {
+    try {
+        if ((Test-Path $logFile) -and ((Get-Item $logFile).Length -gt 1048576)) {
+            $bak = "$logFile.1"
+            if (Test-Path $bak) { Remove-Item $bak -Force -ErrorAction SilentlyContinue }
+            Move-Item $logFile $bak -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
     $line = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") + " " + $msg
     Add-Content -Path $logFile -Value $line -Encoding UTF8
 }
@@ -90,24 +97,47 @@ function Restore-SystemDirect {
 
 function Test-SniAlive {
     $portOpen = $false
+    $foreignOwner = ""
     try {
-        $conn = Get-NetTCPConnection -LocalPort 8888 -State Listen -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($conn) {
+        $conns = @(Get-NetTCPConnection -LocalPort 8888 -State Listen -ErrorAction SilentlyContinue)
+        if ($conns.Count -gt 0) {
             $portOpen = $true
-            $ownerPid = [int]$conn.OwningProcess
-            $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction SilentlyContinue
-            if ($proc -and ($proc.Name -eq "python.exe" -or $proc.Name -eq "pythonw.exe")) {
-                if ($proc.CommandLine -and $proc.CommandLine -like "*mitm_sni_proxy*") {
-                    return @($true, $true)
-                } elseif (Test-Path $sniPidFile) {
-                    $saved = Get-Content $sniPidFile -Raw -ErrorAction SilentlyContinue
-                    if ($saved -and $saved.Trim() -eq [string]$ownerPid) { return @($true, $true) }
+            $savedPid = $null
+            if (Test-Path $sniPidFile) {
+                $rawSaved = Get-Content $sniPidFile -Raw -ErrorAction SilentlyContinue
+                if ($rawSaved -and $rawSaved.Trim() -match "^\d+$") {
+                    $savedPid = [int]$rawSaved.Trim()
+                }
+            }
+            foreach ($conn in $conns) {
+                $ownerPid = [int]$conn.OwningProcess
+                $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction SilentlyContinue
+                if ($proc) {
+                    $pname = [string]$proc.Name
+                    $cmd = [string]$proc.CommandLine
+                    if ($pname -in @("python.exe", "pythonw.exe")) {
+                        if (($cmd -like "*mitm_sni_proxy*") -or ($savedPid -eq $ownerPid)) {
+                            return @($true, $true, "")
+                        }
+                    } elseif ($pname -eq "toci.exe") {
+                        if (($cmd -like "*--proxy*") -or ($savedPid -eq $ownerPid)) {
+                            return @($true, $true, "")
+                        }
+                    }
+                    if (-not $foreignOwner) { $foreignOwner = "$pname (PID $ownerPid)" }
+                } else {
+                    if ($savedPid -eq $ownerPid) {
+                        $p = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+                        if ($p -and -not $p.HasExited) {
+                            return @($true, $true, "")
+                        }
+                    }
+                    if (-not $foreignOwner) { $foreignOwner = "PID $ownerPid" }
                 }
             }
         }
     } catch { }
-    return @($false, $portOpen)
+    return @($false, $portOpen, $foreignOwner)
 }
 
 function Test-TunAlive {
@@ -129,6 +159,7 @@ function Test-TunAlive {
 
 $sniDownCount = 0
 $tunDownCount = 0
+$lastForeignLogged = ""
 
 while ((Test-Path $sniFlag) -or (Test-Path $tunFlag)) {
     Start-Sleep -Seconds 3
@@ -140,11 +171,17 @@ while ((Test-Path $sniFlag) -or (Test-Path $tunFlag)) {
         $res = Test-SniAlive
         $alive = [bool]$res[0]
         $portOpen = [bool]$res[1]
+        $foreignOwner = [string]$res[2]
         if ($alive) {
             $sniDownCount = 0
+            $lastForeignLogged = ""
         } else {
             if ($portOpen) {
-                Write-Log "port 8888 is owned by another process; treating SNI proxy as down"
+                $desc = if ($foreignOwner) { $foreignOwner } else { "another process" }
+                if ($lastForeignLogged -ne $desc) {
+                    Write-Log "port 8888 is owned by $desc; treating SNI proxy as down"
+                    $lastForeignLogged = $desc
+                }
             }
             $sniDownCount++
             if ($sniDownCount -ge 2) {
@@ -154,10 +191,12 @@ while ((Test-Path $sniFlag) -or (Test-Path $tunFlag)) {
                     Restore-SystemDirect
                 }
                 $sniDownCount = 0
+                $lastForeignLogged = ""
             }
         }
     } else {
         $sniDownCount = 0
+        $lastForeignLogged = ""
     }
 
     if ($hasTun) {

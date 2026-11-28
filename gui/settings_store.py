@@ -11,11 +11,15 @@ class SettingsStore(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._qs = QSettings(ORG_NAME, APP_NAME)
+        self._mem = {}
 
     def get(self, key, default=None):
         if key in DEFAULTS:
             default = DEFAULTS[key]
-        value = self._qs.value(key, defaultValue=default)
+        if key in self._mem:
+            value = self._mem[key]
+        else:
+            value = self._qs.value(key, defaultValue=default)
         # QSettings returns strings for older values; normalize types
         if isinstance(default, bool):
             if isinstance(value, str):
@@ -31,6 +35,7 @@ class SettingsStore(QObject):
         return value
 
     def set(self, key, value):
+        self._mem[key] = value
         self._qs.setValue(key, value)
         self._qs.sync()
         self.changed.emit(self.snapshot())

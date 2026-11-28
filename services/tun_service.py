@@ -19,10 +19,12 @@ import urllib.error
 import urllib.request
 
 from sni_proxy import config
+from sni_proxy.certs import harden_key_acl
 
 from .util import BASE_DIR, NO_WINDOW, run_hidden
 
 _lock = threading.Lock()
+_DPAPI_PREFIX = "dpapi:"
 
 TUN_CONFIG_FILE = os.path.join(BASE_DIR, "tun_config.json")
 TUN_YAML_FILE = os.path.join(BASE_DIR, "state", "tun_mihomo.yaml")
@@ -179,6 +181,100 @@ def find_mihomo_exe():
     return None
 
 
+# --------------------------------------------------------------- DPAPI Secrets
+
+def _dpapi_call(data_bytes, protect=True):
+    """Encrypt or decrypt bytes via Windows DPAPI (current user scope)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _DATA_BLOB(ctypes.Structure):
+        _fields_ = [
+            ("cbData", wintypes.DWORD),
+            ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
+        ]
+
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    buf = ctypes.create_string_buffer(data_bytes, len(data_bytes))
+    in_blob = _DATA_BLOB(
+        len(data_bytes),
+        ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)),
+    )
+    out_blob = _DATA_BLOB()
+    CRYPTPROTECT_UI_FORBIDDEN = 0x1
+    if protect:
+        ok = crypt32.CryptProtectData(
+            ctypes.byref(in_blob), "toci-tun", None, None, None,
+            CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out_blob),
+        )
+    else:
+        ok = crypt32.CryptUnprotectData(
+            ctypes.byref(in_blob), None, None, None, None,
+            CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(out_blob),
+        )
+    if not ok:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return ctypes.string_at(out_blob.pbData, out_blob.cbData)
+    finally:
+        kernel32.LocalFree(out_blob.pbData)
+
+
+def _protect_secret(text):
+    """Return DPAPI-protected string for disk storage (empty stays empty)."""
+    s = str(text or "")
+    if not s or s.startswith(_DPAPI_PREFIX):
+        return s
+    if os.name == "nt":
+        try:
+            enc = _dpapi_call(s.encode("utf-8"), protect=True)
+            return _DPAPI_PREFIX + base64.b64encode(enc).decode("ascii")
+        except Exception:
+            return s
+    return s
+
+
+def _unprotect_secret(value):
+    """Decrypt DPAPI-protected string, passing legacy plaintext through."""
+    s = str(value or "")
+    if not s or not s.startswith(_DPAPI_PREFIX):
+        return s
+    if os.name != "nt":
+        return ""
+    try:
+        raw = base64.b64decode(s[len(_DPAPI_PREFIX):].encode("ascii"))
+        return _dpapi_call(raw, protect=False).decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _has_plaintext_secret(raw):
+    if not isinstance(raw, dict):
+        return False
+    pw = str(raw.get("password") or "")
+    if pw and not pw.startswith(_DPAPI_PREFIX):
+        return True
+    for p in raw.get("profiles") or []:
+        if isinstance(p, dict):
+            ppw = str(p.get("password") or "")
+            if ppw and not ppw.startswith(_DPAPI_PREFIX):
+                return True
+    return False
+
+
+def _prepare_disk_config(clean_cfg):
+    """Return a deep copy of *clean_cfg* with secrets encrypted for disk."""
+    disk = copy.deepcopy(clean_cfg)
+    disk["password"] = _protect_secret(disk.get("password", ""))
+    for p in disk.get("profiles") or []:
+        p["password"] = _protect_secret(p.get("password", ""))
+    return disk
+
+
 # --------------------------------------------------------------- Config Store
 
 def _normalize_profile(p, fallback_id=None):
@@ -200,7 +296,7 @@ def _normalize_profile(p, fallback_id=None):
         "server": srv,
         "port": prt,
         "username": str((p or {}).get("username") or ""),
-        "password": str((p or {}).get("password") or ""),
+        "password": _unprotect_secret((p or {}).get("password") or ""),
         "udp": bool((p or {}).get("udp", True)),
         "last_status": str((p or {}).get("last_status") or ""),
         "last_latency_ms": (p or {}).get("last_latency_ms"),
@@ -240,7 +336,7 @@ def _normalize_config(raw):
     proto = str(cfg.get("protocol") or "socks5").strip().lower()
     cfg["protocol"] = proto if proto in ("socks5", "http") else "socks5"
     cfg["username"] = str(cfg.get("username") or "")
-    cfg["password"] = str(cfg.get("password") or "")
+    cfg["password"] = _unprotect_secret(cfg.get("password") or "")
 
     # Normalize saved proxy profiles; migrate legacy single-server config automatically
     clean_profiles = []
@@ -331,21 +427,35 @@ def _normalize_config(raw):
     return cfg
 
 
+def _write_tun_config_locked(clean_cfg):
+    disk_cfg = _prepare_disk_config(clean_cfg)
+    tmp = TUN_CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(disk_cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, TUN_CONFIG_FILE)
+    harden_key_acl(TUN_CONFIG_FILE)
+
+
 def load_tun_config():
     """Load tun_config.json (creating default on first read if absent)."""
     with _lock:
         if not os.path.exists(TUN_CONFIG_FILE):
             cfg = copy.deepcopy(DEFAULT_TUN_CONFIG)
             try:
-                with open(TUN_CONFIG_FILE, "w", encoding="utf-8") as f:
-                    json.dump(cfg, f, indent=2, ensure_ascii=False)
+                _write_tun_config_locked(cfg)
             except OSError:
                 pass
             return cfg
         try:
             with open(TUN_CONFIG_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            return _normalize_config(raw)
+            clean = _normalize_config(raw)
+            if os.name == "nt" and _has_plaintext_secret(raw):
+                try:
+                    _write_tun_config_locked(clean)
+                except OSError:
+                    pass
+            return clean
         except Exception:
             return copy.deepcopy(DEFAULT_TUN_CONFIG)
 
@@ -354,10 +464,7 @@ def save_tun_config(cfg):
     """Persist tun_config.json atomically and regenerate Mihomo YAML if valid."""
     clean = _normalize_config(cfg)
     with _lock:
-        tmp = TUN_CONFIG_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(clean, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, TUN_CONFIG_FILE)
+        _write_tun_config_locked(clean)
     if clean["server"]:
         try:
             export_mihomo_yaml(clean)
@@ -624,6 +731,7 @@ def export_mihomo_yaml(cfg=None):
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)
     os.replace(tmp, TUN_YAML_FILE)
+    harden_key_acl(TUN_YAML_FILE)
     return TUN_YAML_FILE
 
 

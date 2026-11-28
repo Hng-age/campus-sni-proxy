@@ -38,7 +38,7 @@ class UpdateError(RuntimeError):
 # Version helpers
 # ----------------------------------------------------------------------
 def parse_version(text):
-    """'v3.5.0' -> (3, 5, 0); empty/invalid -> ()."""
+    """'v3.5.1' -> (3, 5, 1); empty/invalid -> ()."""
     nums = re.findall(r"\d+", str(text or ""))
     return tuple(int(n) for n in nums[:4]) if nums else ()
 
@@ -140,9 +140,24 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+def _validate_asset_url(url):
+    """Allow only HTTPS downloads from GitHub release hosts."""
+    from urllib.parse import urlparse
+    p = urlparse(str(url or "").strip())
+    host = (p.hostname or "").lower()
+    allowed = (
+        host == "github.com"
+        or host == "api.github.com"
+        or host.endswith(".githubusercontent.com")
+    )
+    if p.scheme != "https" or not allowed:
+        raise UpdateError(f"更新地址不受信任，已拒绝下载：{url}")
+
+
 def _download_stream(info, dest, use_proxy, on_progress=None,
                      should_cancel=None):
     url = info["asset_url"]
+    _validate_asset_url(url)
     total = int(info.get("asset_size") or 0)
     headers = dict(API_HEADERS)
     headers["Accept"] = "application/octet-stream"
@@ -186,11 +201,23 @@ def download(info, dest, on_progress=None, should_cancel=None):
     else:
         raise UpdateError("下载更新失败（" + "；".join(errors) + "）")
 
-    digest = str(info.get("asset_digest") or "")
-    if digest.lower().startswith("sha256:"):
-        actual = _sha256(dest)
-        if actual.lower() != digest.split(":", 1)[1].strip().lower():
-            raise UpdateError("更新包校验失败（SHA256 不匹配），已终止")
+    digest = str(info.get("asset_digest") or "").strip()
+    if not digest.lower().startswith("sha256:"):
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+        raise UpdateError("发布包缺少 SHA256 校验摘要，已终止更新")
+    expected = digest.split(":", 1)[1].strip().lower()
+    actual = _sha256(dest).lower()
+    if not expected or actual != expected:
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+        raise UpdateError("更新包校验失败（SHA256 不匹配），已终止")
 
 
 def _safe_extract(zip_path, dest_dir):
@@ -274,6 +301,33 @@ if (-not (Test-Path (Join-Path $SrcDir $ExeName))) {
   Write-Log "source exe missing, abort"
   exit 2
 }
+$restartProxy = $false
+try {
+  $appNorm = [System.IO.Path]::GetFullPath($AppDir).TrimEnd('\')
+  $proxyProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -eq $ExeName -and $_.CommandLine -like "*--proxy*" -and $_.ExecutablePath -and ([System.IO.Path]::GetDirectoryName($_.ExecutablePath).TrimEnd('\') -eq $appNorm)
+  }
+  foreach ($pp in $proxyProcs) {
+    Stop-Process -Id $pp.ProcessId -Force -ErrorAction SilentlyContinue
+    $restartProxy = $true
+    Write-Log "stopped headless proxy pid $($pp.ProcessId)"
+  }
+  if ($restartProxy) { Start-Sleep -Milliseconds 500 }
+} catch { }
+if (Test-Path (Join-Path $SrcDir "_internal")) {
+  $oldInternal = Join-Path $AppDir "_internal"
+  if (Test-Path $oldInternal) {
+    Remove-Item $oldInternal -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Log "cleaned old _internal"
+  }
+}
+foreach ($stale in @("config.py", "rules_manager.py", "server.py")) {
+  $sp = Join-Path $AppDir $stale
+  if (Test-Path $sp) {
+    Remove-Item $sp -Force -ErrorAction SilentlyContinue
+    Write-Log "removed stale top-level $stale"
+  }
+}
 $excludeFiles = @("rules.json", "tun_config.json")
 $excludeDirs = @("logs", "state", "mitm_certs", "__pycache__")
 $copyArgs = @($SrcDir, $AppDir, "/E", "/R:2", "/W:1", "/NFL", "/NDL", "/NJH", "/NJS", "/NP")
@@ -298,6 +352,10 @@ Write-Log "files copied"
 if (-not $NoStart) {
   $exe = Join-Path $AppDir $ExeName
   if (Test-Path $exe) {
+    if ($restartProxy) {
+      Start-Process -FilePath $exe -ArgumentList "--proxy" -WorkingDirectory $AppDir -WindowStyle Hidden
+      Write-Log "restarted headless proxy $exe"
+    }
     Start-Process -FilePath $exe -WorkingDirectory $AppDir
     Write-Log "restarted $exe"
   } else {

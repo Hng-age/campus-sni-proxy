@@ -7,7 +7,7 @@ import time
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QVBoxLayout, QWidget,
+    QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from gui.components.hero_banner import HeroBanner
@@ -118,6 +118,7 @@ class DashboardPage(Page):
 
         for b in (self.btn_start, self.btn_stop, self.btn_tun, self.btn_diag, self.btn_logs):
             b.setMinimumWidth(0)
+            b.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             ops_row.addWidget(b, 1)
 
         po_v.addLayout(ops_row)
@@ -148,17 +149,23 @@ class DashboardPage(Page):
 
         self.item_dns = QLabel("DNS 解析：待检测")
         self.item_dns.setObjectName("ItemText")
+        self.item_dns.setWordWrap(True)
         self.item_dns.setMinimumWidth(0)
+        self.item_dns.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         pn_v.addWidget(self.item_dns)
 
         self.item_upstream = QLabel("根证书：待检查")
         self.item_upstream.setObjectName("ItemText")
+        self.item_upstream.setWordWrap(True)
         self.item_upstream.setMinimumWidth(0)
+        self.item_upstream.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         pn_v.addWidget(self.item_upstream)
 
         self.item_latency = QLabel("本地代理延迟：—")
         self.item_latency.setObjectName("ItemText")
+        self.item_latency.setWordWrap(True)
         self.item_latency.setMinimumWidth(0)
+        self.item_latency.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         pn_v.addWidget(self.item_latency)
 
         env = env_info()
@@ -280,7 +287,9 @@ class DashboardPage(Page):
             time_lab.setObjectName("TimelineTime")
             desc_lab = QLabel(desc)
             desc_lab.setObjectName("TimelineText")
+            desc_lab.setWordWrap(True)
             desc_lab.setMinimumWidth(0)
+            desc_lab.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             row.addWidget(dot)
             row.addWidget(time_lab)
             row.addWidget(desc_lab, 1)

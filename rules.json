@@ -1,6 +1,6 @@
 {
-  "version": "3.5.0",
-  "updated_at": "2026-11-26 21:03:30",
+  "version": "3.5.1",
+  "updated_at": "2026-11-28 18:00:00",
   "proxy_mode": "pac",
   "pac_port": 8888,
   "blocked_suffixes": [

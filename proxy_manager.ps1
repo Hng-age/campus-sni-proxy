@@ -8,7 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Version = "3.0.0"
+$Version = "3.5.1"
 
 # 隐藏控制台中的提权脚本偶发“动作已执行完但 PowerShell 进程不退出”，
 # 会让 GUI 的操作线程一直等待、按钮永久置灰。用硬退出规避该问题。
@@ -21,6 +21,16 @@ if ($Action -ne "") {
     try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
 }
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$TociExe = Join-Path $ScriptDir "toci.exe"
+$CfgPy = Join-Path $ScriptDir "sni_proxy\config.py"
+if (Test-Path $CfgPy) {
+    try {
+        $cfgText = Get-Content $CfgPy -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+        if ($cfgText -match 'VERSION\s*=\s*"([0-9]+(?:\.[0-9]+)+)"') {
+            $Version = $Matches[1]
+        }
+    } catch { }
+}
 $ProxyScript = Join-Path $ScriptDir "mitm_sni_proxy.py"
 $CertDir = Join-Path $ScriptDir "mitm_certs"
 $CaCert = Join-Path $CertDir "ca_cert.crt"
@@ -315,7 +325,22 @@ function Install-GitForWindows {
     return (Find-OpenSSL)
 }
 
+function Test-PythonHasCryptography([string]$pyExe) {
+    if (-not $pyExe -or -not (Test-Path $pyExe)) { return $false }
+    try {
+        & $pyExe -c "import cryptography" 2>$null | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
 function Ensure-Dependencies {
+    # 便携版自带 toci.exe 时内置 Python + cryptography，无需安装外部 Python / Git
+    if (Test-Path $TociExe) {
+        return $true
+    }
+
     $py = Find-Python
     if (-not $py) {
         Write-Host "  [!] 未检测到 Python，正在自动安装（首次运行需要联网）..." -ForegroundColor Yellow
@@ -329,7 +354,7 @@ function Ensure-Dependencies {
     }
 
     $needCerts = (-not (Test-Path $CaCert)) -or (-not (Test-Path $WildcardCert))
-    if ($needCerts -and -not (Find-OpenSSL)) {
+    if ($needCerts -and (-not (Test-PythonHasCryptography $py.Exe)) -and (-not (Find-OpenSSL))) {
         Write-Host "  [!] 首次运行需要生成设备证书，正在自动安装 Git for Windows..." -ForegroundColor Yellow
         $ossl = Install-GitForWindows
         if (-not $ossl) {
@@ -361,7 +386,13 @@ function Initialize-Certs {
     if (-not (Ensure-Dependencies)) { return $false }
 
     $py = Find-Python
-    if (-not $py) {
+    $useToci = $false
+    if (Test-Path $TociExe) {
+        if ((-not $py) -or (-not (Test-PythonHasCryptography $py.Exe))) {
+            $useToci = $true
+        }
+    }
+    if ((-not $useToci) -and (-not $py)) {
         Write-Host "  [!!] 未检测到 Python，无法初始化设备证书" -ForegroundColor Red
         return $false
     }
@@ -376,10 +407,9 @@ function Initialize-Certs {
         } catch { }
     }
     $needNew = (-not (Test-Path $CaCert)) -or (-not (Test-Path $WildcardCert))
-    if (($needNew -or $isLegacy) -and -not $ossl) {
-        Write-Host "  [!!] 首次使用/安全升级需要生成设备专属证书，但未检测到 openssl" -ForegroundColor Red
-        Write-Host "       请安装 Git for Windows（自带 openssl）后重新运行：" -ForegroundColor Yellow
-        Write-Host "       https://git-scm.com/download/win" -ForegroundColor Yellow
+    if ((-not $useToci) -and ($needNew -or $isLegacy) -and (-not (Test-PythonHasCryptography $py.Exe)) -and (-not $ossl)) {
+        Write-Host "  [!!] 首次使用/安全升级需要生成设备专属证书，但未检测到 cryptography 或 openssl" -ForegroundColor Red
+        Write-Host "       请安装 Git for Windows（自带 openssl）或 cryptography 后重新运行" -ForegroundColor Yellow
         return $false
     }
 
@@ -390,10 +420,17 @@ function Initialize-Certs {
     try {
         # 用重定向文件接收输出，避免 Python 的 stderr 日志被 PowerShell
         # 当成 NativeCommandError 中断脚本
-        $p = Start-Process -FilePath $py.Exe `
-            -ArgumentList @("`"$ProxyScript`"", "--init-certs") `
-            -WindowStyle Hidden -Wait -PassThru `
-            -RedirectStandardOutput $initOut -RedirectStandardError $initErr
+        if ($useToci) {
+            $p = Start-Process -FilePath $TociExe `
+                -ArgumentList @("--init-certs") `
+                -WindowStyle Hidden -Wait -PassThru `
+                -RedirectStandardOutput $initOut -RedirectStandardError $initErr
+        } else {
+            $p = Start-Process -FilePath $py.Exe `
+                -ArgumentList @("`"$ProxyScript`"", "--init-certs") `
+                -WindowStyle Hidden -Wait -PassThru `
+                -RedirectStandardOutput $initOut -RedirectStandardError $initErr
+        }
         $code = $p.ExitCode
     } catch {
         Write-Host "  [!!] 无法运行证书初始化：$($_.Exception.Message)" -ForegroundColor Red
@@ -730,8 +767,12 @@ function Test-ProxyRunning {
         $proc = $null
     }
     if (-not $proc) { return $false }
-    if ($proc.Name -notin @("python.exe", "pythonw.exe")) { return $false }
-    if ($proc.CommandLine -and $proc.CommandLine -like "*mitm_sni_proxy*") { return $true }
+    if ($proc.Name -notin @("python.exe", "pythonw.exe", "toci.exe")) { return $false }
+    if ($proc.Name -eq "toci.exe") {
+        if ($proc.CommandLine -and $proc.CommandLine -like "*--proxy*") { return $true }
+    } elseif ($proc.CommandLine -and $proc.CommandLine -like "*mitm_sni_proxy*") {
+        return $true
+    }
     $pidFile = Join-Path $StateDir "proxy.pid"
     if (Test-Path $pidFile) {
         $saved = Get-Content $pidFile -Raw -ErrorAction SilentlyContinue
@@ -831,7 +872,11 @@ function Start-Proxy {
     }
 
     $py = Find-Python
-    if (-not $py) {
+    $useToci = $false
+    if (Test-Path $TociExe) {
+        if (-not $py) { $useToci = $true }
+    }
+    if ((-not $useToci) -and (-not $py)) {
         Write-Host "  [!!] 未检测到 Python（需要 3.8 或更高版本）" -ForegroundColor Red
         Write-Host "       1) 打开 https://www.python.org/downloads/ 下载安装" -ForegroundColor Yellow
         Write-Host "       2) 安装第一步务必勾选 “Add python.exe to PATH”" -ForegroundColor Yellow
@@ -842,14 +887,15 @@ function Start-Proxy {
     $ossl = Find-OpenSSL
     if ($ossl) {
         $env:OPENSSL_EXE = $ossl
-    } else {
-        Write-Host "  [提示] 未检测到 openssl：已有证书可继续使用，但新域名证书无法生成" -ForegroundColor Yellow
-        Write-Host "         安装 Git for Windows 可彻底解决" -ForegroundColor DarkGray
     }
 
-    if (-not (Test-Path $ProxyScript)) {
-        Write-Host "  [!!] 找不到代理程序：$ProxyScript" -ForegroundColor Red
-        return $false
+    if ((-not $useToci) -and (-not (Test-Path $ProxyScript))) {
+        if (Test-Path $TociExe) {
+            $useToci = $true
+        } else {
+            Write-Host "  [!!] 找不到代理程序：$ProxyScript" -ForegroundColor Red
+            return $false
+        }
     }
 
     $owner = Get-PortOwner
@@ -859,11 +905,17 @@ function Start-Proxy {
         return $false
     }
 
-    Write-Host "  [*] Python: $($py.Version)  ($($py.Exe))" -ForegroundColor DarkGray
+    if ($useToci) {
+        Write-Host "  [*] 运行模式: 便携版内置运行时 ($TociExe --proxy)" -ForegroundColor DarkGray
+        $runner = $TociExe
+        $runnerArgs = @("--proxy")
+    } else {
+        Write-Host "  [*] Python: $($py.Version)  ($($py.Exe))" -ForegroundColor DarkGray
+        $runner = $py.Exe
+        if ($py.Windowless) { $runner = $py.Windowless }
+        $runnerArgs = @("`"$ProxyScript`"")
+    }
     Write-Host "  [*] 正在启动代理..." -ForegroundColor Yellow
-
-    $runner = $py.Exe
-    if ($py.Windowless) { $runner = $py.Windowless }
 
     $logOut = Join-Path $env:TEMP "sni_proxy_out.log"
     $logErr = Join-Path $env:TEMP "sni_proxy_err.log"
@@ -871,10 +923,10 @@ function Start-Proxy {
 
     $proc = $null
     try {
-        $proc = Start-Process -FilePath $runner -ArgumentList "`"$ProxyScript`"" -WindowStyle Hidden -PassThru -RedirectStandardOutput $logOut -RedirectStandardError $logErr
+        $proc = Start-Process -FilePath $runner -ArgumentList $runnerArgs -WindowStyle Hidden -PassThru -RedirectStandardOutput $logOut -RedirectStandardError $logErr
     } catch {
-        Write-Host "  [!!] 无法启动 Python：$($_.Exception.Message)" -ForegroundColor Red
-        Write-Host "       可能被杀毒软件拦截，请允许 python.exe / pythonw.exe 运行后重试。" -ForegroundColor Yellow
+        Write-Host "  [!!] 无法启动代理进程：$($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "       可能被杀毒软件拦截，请允许运行后重试。" -ForegroundColor Yellow
         return $false
     }
     Start-Sleep -Seconds 3
@@ -897,7 +949,10 @@ function Stop-Proxy {
     Write-Host "  [*] 正在停止代理..." -ForegroundColor Yellow
 
     $procs = Get-CimInstance Win32_Process |
-        Where-Object { ($_.Name -eq "python.exe" -or $_.Name -eq "pythonw.exe") -and $_.CommandLine -like "*mitm_sni_proxy*" }
+        Where-Object {
+            (($_.Name -eq "python.exe" -or $_.Name -eq "pythonw.exe") -and $_.CommandLine -like "*mitm_sni_proxy*") -or
+            ($_.Name -eq "toci.exe" -and $_.CommandLine -like "*--proxy*")
+        }
 
     if ($procs) {
         foreach ($p in $procs) {
@@ -912,7 +967,7 @@ function Stop-Proxy {
         Select-Object -First 1
     if ($conn) {
         $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
-        if ($proc -and ($proc.ProcessName -eq "python" -or $proc.ProcessName -eq "pythonw")) {
+        if ($proc -and ($proc.ProcessName -in @("python", "pythonw", "toci"))) {
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
             Write-Host "  [OK] 已结束端口占用进程 PID $($proc.Id)" -ForegroundColor Green
         }
@@ -1030,7 +1085,10 @@ function Show-Status {
     if ($running) {
         Write-Host "  代理进程:   [运行中] 端口 8888" -ForegroundColor Green
         $procs = Get-CimInstance Win32_Process |
-            Where-Object { ($_.Name -eq "python.exe" -or $_.Name -eq "pythonw.exe") -and $_.CommandLine -like "*mitm_sni_proxy*" }
+            Where-Object {
+                (($_.Name -eq "python.exe" -or $_.Name -eq "pythonw.exe") -and $_.CommandLine -like "*mitm_sni_proxy*") -or
+                ($_.Name -eq "toci.exe" -and $_.CommandLine -like "*--proxy*")
+            }
         foreach ($p in $procs) {
             $memMB = [math]::Round($p.WorkingSetSize / 1MB, 1)
             Write-Host "               PID $($p.ProcessId)，内存 ${memMB}MB" -ForegroundColor DarkGray
